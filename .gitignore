@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Database (runtime data, not code)
+*.db
+*.db-journal
+
+# User storage (downloaded EPUBs)
+backend/storage/
+
+# Logs
+*.log
+
+# Build output
+frontend/dist/
+frontend/dist_v1_blue/
+
+# iOS native build (regenerated from source)
+frontend/ios/
+
+# Environment
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Lock files (generated from package.json)
+package-lock.json

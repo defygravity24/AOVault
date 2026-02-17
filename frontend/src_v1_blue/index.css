@@ -1,0 +1,95 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --vault-bg: #0d1117;
+    --vault-card: #161b22;
+    --vault-border: #30363d;
+    --vault-text: #c9d1d9;
+    --vault-muted: #8b949e;
+    --vault-accent: #006699;
+  }
+
+  body {
+    @apply bg-vault-bg text-vault-text font-sans;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Custom scrollbar for that cozy feel */
+  ::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-vault-bg;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-vault-border rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-vault-muted;
+  }
+}
+
+@layer components {
+  /* Card component - the core of the fic display */
+  .vault-card {
+    @apply bg-vault-card border border-vault-border rounded-lg p-4
+           transition-all duration-200 hover:border-lj-blue-500 hover:shadow-vault;
+  }
+
+  /* Button styles */
+  .vault-btn {
+    @apply px-4 py-2 rounded-md font-medium transition-all duration-200
+           focus:outline-none focus:ring-2 focus:ring-lj-blue-500 focus:ring-offset-2 focus:ring-offset-vault-bg;
+  }
+
+  .vault-btn-primary {
+    @apply vault-btn bg-lj-blue-500 text-white hover:bg-lj-blue-600;
+  }
+
+  .vault-btn-secondary {
+    @apply vault-btn bg-vault-card border border-vault-border text-vault-text
+           hover:bg-vault-border hover:border-lj-blue-500;
+  }
+
+  /* Input styles */
+  .vault-input {
+    @apply w-full px-4 py-2 bg-vault-bg border border-vault-border rounded-md
+           text-vault-text placeholder-vault-muted
+           focus:outline-none focus:border-lj-blue-500 focus:ring-1 focus:ring-lj-blue-500
+           transition-all duration-200;
+  }
+
+  /* Tag/chip styles for fandoms, ships, etc */
+  .vault-tag {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium
+           bg-lj-blue-900/50 text-lj-blue-300 border border-lj-blue-700/50;
+  }
+
+  .vault-tag-green {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium
+           bg-lj-green-900/50 text-lj-green-300 border border-lj-green-700/50;
+  }
+}
+
+@layer utilities {
+  /* Text gradient for fancy headers */
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-lj-blue-400 to-lj-green-400;
+  }
+
+  /* Glow effect for important elements */
+  .vault-glow {
+    box-shadow: 0 0 20px rgba(0, 102, 153, 0.3);
+  }
+}
