@@ -55,12 +55,36 @@ export default function Library() {
     setImporting(true)
     const loadingToast = toast.loading('Saving from AO3...')
     try {
-      const response = await apiFetch(`${API_URL}/fics/import`, {
+      // First try: let server fetch from AO3
+      let response = await apiFetch(`${API_URL}/fics/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url }),
       })
-      const data = await response.json()
+      let data = await response.json()
+
+      // If server can't reach AO3 (Cloudflare block), fetch from browser and relay HTML
+      if (response.status === 422 && data.needsClientFetch) {
+        toast.dismiss(loadingToast)
+        const relayToast = toast.loading('Fetching from AO3 directly...')
+        try {
+          const ao3Response = await fetch(url, {
+            headers: { 'Accept': 'text/html' },
+          })
+          const html = await ao3Response.text()
+          response = await apiFetch(`${API_URL}/fics/import`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url, html }),
+          })
+          data = await response.json()
+          toast.dismiss(relayToast)
+        } catch (relayErr) {
+          toast.dismiss(relayToast)
+          throw new Error('Could not reach AO3. Please check your connection.')
+        }
+      }
+
       if (response.status === 409 && data.alreadySaved) {
         toast.dismiss(loadingToast)
         toast(`"${data.title}" is already in your vault!`, { icon: '📚' })

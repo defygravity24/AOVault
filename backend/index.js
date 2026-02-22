@@ -493,6 +493,61 @@ app.post('/api/auth/migrate', (req, res) => {
 // =====================================
 
 /**
+ * Parse AO3 HTML that was already fetched (by client or server)
+ */
+function parseAO3Html(url, htmlString) {
+  const ao3Regex = /archiveofourown\.org\/works\/(\d+)/;
+  const match = url.match(ao3Regex);
+  if (!match) throw new Error('Invalid AO3 URL');
+  const workId = match[1];
+
+  const root = getParseHTML()(htmlString);
+
+  const getLinksText = (selector) => {
+    const el = root.querySelector(selector);
+    if (!el) return [];
+    return el.querySelectorAll('a').map(a => a.text.trim()).filter(Boolean);
+  };
+
+  const title = (root.querySelector('h2.title')?.text || '').trim();
+  const authorEl = root.querySelector('a[rel="author"]');
+  const author = authorEl ? authorEl.text.trim() : '';
+  const authorUrl = authorEl ? authorEl.getAttribute('href') : null;
+  const rating = (root.querySelector('dd.rating')?.text || '').trim();
+  const warnings = getLinksText('dd.warning');
+  const fandoms = getLinksText('dd.fandom');
+  const ships = getLinksText('dd.relationship');
+  const characters = getLinksText('dd.character');
+  const tags = getLinksText('dd.freeform');
+  const categories = getLinksText('dd.category');
+  const language = (root.querySelector('dd.language')?.text || '').trim();
+  const wordsText = root.querySelector('dd.words')?.text || '';
+  const wordCountMatch = wordsText.match(/[\d,]+/);
+  const wordCount = wordCountMatch ? parseInt(wordCountMatch[0].replace(/,/g, '')) : 0;
+  const chapterText = (root.querySelector('dd.chapters')?.text || '').trim();
+  const chapterMatch = chapterText.match(/(\d+)\/(\d+|\?)/);
+  const chapterCount = chapterMatch ? parseInt(chapterMatch[1]) : 1;
+  const chapterTotal = chapterMatch && chapterMatch[2] !== '?' ? parseInt(chapterMatch[2]) : null;
+  const status = chapterTotal && chapterCount >= chapterTotal ? 'Complete' : 'WIP';
+  const published = (root.querySelector('dd.published')?.text || '').trim();
+  const updated = (root.querySelector('dd.status')?.text || '').trim() || published;
+  const summaryBlock = root.querySelector('div.summary blockquote');
+  const summary = summaryBlock ? summaryBlock.text.trim() : '';
+
+  return {
+    source: 'ao3', source_id: workId,
+    source_url: `https://archiveofourown.org/works/${workId}`,
+    title: title || 'Untitled', author: author || 'Anonymous',
+    author_url: authorUrl ? `https://archiveofourown.org${authorUrl}` : null,
+    fandom: fandoms.join(', '), ship: ships.join(', '), rating,
+    warnings: warnings.join(', '), categories: categories.join(', '),
+    characters: characters.join(', '), tags: tags.join(', '), summary,
+    word_count: wordCount, chapter_count: chapterCount, chapter_total: chapterTotal,
+    status, language, published_at: published, updated_at: updated,
+  };
+}
+
+/**
  * Parse AO3 work page and extract metadata
  */
 async function parseAO3Work(url) {
@@ -640,9 +695,12 @@ app.get('/api/health', (req, res) => {
 });
 
 // Import a fic from URL
+// Supports two modes:
+// 1. Server-side fetch: { url: "https://archiveofourown.org/works/..." }
+// 2. Client-side relay: { url: "...", html: "<full page HTML>" } — used when server can't reach AO3
 app.post('/api/fics/import', async (req, res) => {
   try {
-    const { url } = req.body;
+    const { url, html } = req.body;
     const userId = req.userId;
 
     if (!url) {
@@ -652,7 +710,24 @@ app.post('/api/fics/import', async (req, res) => {
     // Determine source and parse
     let ficData;
     if (url.includes('archiveofourown.org')) {
-      ficData = await parseAO3Work(url);
+      if (html) {
+        // Client already fetched the HTML — just parse it
+        ficData = parseAO3Html(url, html);
+      } else {
+        // Try server-side fetch, fall back to asking client to relay
+        try {
+          ficData = await parseAO3Work(url);
+        } catch (fetchErr) {
+          if (fetchErr.message.includes('525') || fetchErr.message.includes('403') || fetchErr.message.includes('503')) {
+            return res.status(422).json({
+              error: 'ao3_blocked',
+              message: 'Server cannot reach AO3. Please retry — the app will fetch it directly.',
+              needsClientFetch: true,
+            });
+          }
+          throw fetchErr;
+        }
+      }
     } else if (url.includes('fanfiction.net')) {
       return res.status(400).json({ error: 'FFN support coming soon!' });
     } else {
