@@ -505,13 +505,17 @@ async function parseAO3Work(url) {
     }
     const workId = match[1];
 
-    // Fetch the page
+    // Fetch the page (use browser-like headers to avoid Cloudflare blocks on cloud IPs)
     const response = await getAxios().get(url, {
       headers: {
-        'User-Agent': 'AOVault/1.0 (Personal Fanfiction Library)',
-        'Accept': 'text/html,application/xhtml+xml',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
       },
-      timeout: 10000,
+      timeout: 15000,
     });
 
     const root = getParseHTML()(response.data);
@@ -604,7 +608,7 @@ async function downloadAO3Epub(workId, userId = 1) {
     const response = await getAxios().get(epubUrl, {
       responseType: 'arraybuffer',
       headers: {
-        'User-Agent': 'AOVault/1.0 (Personal Fanfiction Library)',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       },
       timeout: 30000,
     });
@@ -1441,7 +1445,7 @@ app.get('/api/fics/:id/content', async (req, res) => {
     const fullUrl = `https://archiveofourown.org/works/${fic.source_id}?view_full_work=true&view_adult=true`;
     const response = await getAxios().get(fullUrl, {
       headers: {
-        'User-Agent': 'AOVault/1.0 (Personal Fanfiction Library)',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml',
       },
       timeout: 60000,
@@ -1534,7 +1538,7 @@ app.post('/api/fics/:id/download', async (req, res) => {
     const response = await getAxios().get(downloadUrl, {
       responseType: 'arraybuffer',
       headers: {
-        'User-Agent': 'AOVault/1.0 (personal offline reader; contact@aovault.app)',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       },
       timeout: 60000,
       validateStatus: (status) => status < 500,
