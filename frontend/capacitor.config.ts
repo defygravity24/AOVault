@@ -5,10 +5,9 @@ const config: CapacitorConfig = {
   appName: 'AOVault',
   webDir: 'dist',
   server: {
-    // For development - connects to your local backend
-    // Your iPhone needs to be on the same WiFi network
-    url: 'http://192.168.1.215:5173',
-    cleartext: true
+    // Allow cleartext HTTP to local backend
+    cleartext: true,
+    allowNavigation: ['192.168.1.*', '*.local', 'localhost']
   },
   ios: {
     contentInset: 'automatic',

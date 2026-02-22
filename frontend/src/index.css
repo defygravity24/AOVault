@@ -93,3 +93,44 @@
     box-shadow: 0 0 20px rgba(201, 169, 89, 0.2);
   }
 }
+
+/* Offline reader — renders AO3 HTML content */
+.reader-content {
+  color: var(--vault-text);
+  line-height: 1.8;
+}
+.reader-content p {
+  margin-bottom: 1em;
+}
+.reader-content em, .reader-content i {
+  font-style: italic;
+}
+.reader-content strong, .reader-content b {
+  font-weight: 600;
+}
+.reader-content blockquote {
+  border-left: 3px solid var(--vault-border);
+  padding-left: 1em;
+  margin: 1em 0;
+  color: var(--vault-muted);
+}
+.reader-content hr {
+  border: none;
+  border-top: 1px solid var(--vault-border);
+  margin: 2em 0;
+}
+.reader-content a {
+  color: var(--vault-accent);
+  text-decoration: underline;
+}
+.reader-content h2, .reader-content h3 {
+  font-weight: 600;
+  margin: 1.5em 0 0.5em;
+}
+.reader-content ul, .reader-content ol {
+  padding-left: 1.5em;
+  margin-bottom: 1em;
+}
+.reader-content li {
+  margin-bottom: 0.25em;
+}

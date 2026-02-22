@@ -11,21 +11,79 @@ console.log('[AOVault] Starting server...');
 
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
-const cheerio = require('cheerio');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
+
+// Auth modules
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+// Lazy-loaded modules (heavy imports that can hang in some environments)
+let axios, parseHTML;
+const getAxios = () => { if (!axios) axios = require('axios'); return axios; };
+const getParseHTML = () => { if (!parseHTML) ({ parse: parseHTML } = require('node-html-parser')); return parseHTML; };
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// In production, serve the built frontend
+const isProduction = process.env.NODE_ENV === 'production';
+if (isProduction) {
+  const frontendPath = path.join(__dirname, 'public');
+  if (fs.existsSync(frontendPath)) {
+    app.use(express.static(frontendPath));
+  }
+}
+
+// JWT Secret — generate once, persist in .env
+const envPath = path.join(__dirname, '.env');
+let JWT_SECRET;
+if (fs.existsSync(envPath)) {
+  const envContent = fs.readFileSync(envPath, 'utf8');
+  const match = envContent.match(/JWT_SECRET=(.+)/);
+  if (match) JWT_SECRET = match[1].trim();
+}
+if (!JWT_SECRET) {
+  JWT_SECRET = crypto.randomBytes(64).toString('hex');
+  fs.appendFileSync(envPath, `\nJWT_SECRET=${JWT_SECRET}\n`);
+  console.log('Generated JWT_SECRET and saved to .env');
+}
+
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:3001',
+    'http://192.168.1.215:5173',
+    'http://192.168.1.215:3001',
+    'https://aovault.net',
+    'https://www.aovault.net',
+    'capacitor://localhost',
+    'ionic://localhost',
+  ],
+  credentials: true,
+}));
 app.use(express.json());
 
+// AO3 rate limiter — minimum 1.5s between requests
+let lastAO3Request = 0;
+const ao3RateLimit = () => new Promise(resolve => {
+  const now = Date.now();
+  const elapsed = now - lastAO3Request;
+  if (elapsed < 1500) {
+    setTimeout(() => { lastAO3Request = Date.now(); resolve(); }, 1500 - elapsed);
+  } else {
+    lastAO3Request = now;
+    resolve();
+  }
+});
+
 // Initialize SQLite database
-const dbPath = path.join(__dirname, 'aovault.db');
+// In production on Render, use persistent disk mount if available
+const dataDir = process.env.DATA_DIR || __dirname;
+const dbPath = path.join(dataDir, 'aovault.db');
 const db = new Database(dbPath);
 
 // Create tables
@@ -80,15 +138,355 @@ db.exec(`
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (fic_id) REFERENCES fics(id)
   );
+
+  CREATE TABLE IF NOT EXISTS collections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER DEFAULT 1,
+    name TEXT NOT NULL,
+    description TEXT,
+    icon TEXT DEFAULT '📚',
+    is_smart BOOLEAN DEFAULT 0,
+    smart_rules TEXT,
+    position INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS collection_fics (
+    collection_id INTEGER NOT NULL,
+    fic_id INTEGER NOT NULL,
+    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (collection_id, fic_id),
+    FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+    FOREIGN KEY (fic_id) REFERENCES fics(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS reaction_types (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT UNIQUE NOT NULL,
+    emoji TEXT NOT NULL,
+    label TEXT NOT NULL,
+    position INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS fic_reactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fic_id INTEGER NOT NULL,
+    reaction_code TEXT NOT NULL,
+    chapter_number INTEGER,
+    intensity INTEGER DEFAULT 3,
+    note TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (fic_id) REFERENCES fics(id) ON DELETE CASCADE
+  );
 `);
 
 console.log('Database initialized at:', dbPath);
+
+// Phase 4: Elite Vault & Notify When Complete — add columns if missing
+const ficColumns = db.prepare("PRAGMA table_info(fics)").all().map(c => c.name);
+if (!ficColumns.includes('in_elite_vault')) {
+  db.exec(`
+    ALTER TABLE fics ADD COLUMN in_elite_vault INTEGER DEFAULT 0;
+  `);
+  console.log('Added in_elite_vault column');
+}
+if (!ficColumns.includes('notify_on_complete')) {
+  db.exec(`
+    ALTER TABLE fics ADD COLUMN notify_on_complete INTEGER DEFAULT 0;
+  `);
+  console.log('Added notify_on_complete column');
+}
+if (!ficColumns.includes('binge_threshold')) {
+  db.exec(`
+    ALTER TABLE fics ADD COLUMN binge_threshold INTEGER DEFAULT 0;
+  `);
+  console.log('Added binge_threshold column');
+}
+if (!ficColumns.includes('times_read')) {
+  db.exec(`
+    ALTER TABLE fics ADD COLUMN times_read INTEGER DEFAULT 0;
+  `);
+  console.log('Added times_read column');
+}
+if (!ficColumns.includes('last_checked_at')) {
+  db.exec(`
+    ALTER TABLE fics ADD COLUMN last_checked_at DATETIME;
+  `);
+  console.log('Added last_checked_at column');
+}
+if (!ficColumns.includes('elite_pin')) {
+  db.exec(`
+    ALTER TABLE fics ADD COLUMN elite_pin TEXT;
+  `);
+}
+// Offline download columns
+if (!ficColumns.includes('download_status')) {
+  db.exec(`ALTER TABLE fics ADD COLUMN download_status TEXT DEFAULT 'none';`);
+  console.log('Added download_status column');
+}
+if (!ficColumns.includes('download_format')) {
+  db.exec(`ALTER TABLE fics ADD COLUMN download_format TEXT;`);
+}
+if (!ficColumns.includes('download_path')) {
+  db.exec(`ALTER TABLE fics ADD COLUMN download_path TEXT;`);
+}
+if (!ficColumns.includes('downloaded_at')) {
+  db.exec(`ALTER TABLE fics ADD COLUMN downloaded_at DATETIME;`);
+}
+if (!ficColumns.includes('file_size')) {
+  db.exec(`ALTER TABLE fics ADD COLUMN file_size INTEGER;`);
+}
+
+// Auth: add password_hash to users table
+const userColumns = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
+if (!userColumns.includes('password_hash')) {
+  db.exec(`ALTER TABLE users ADD COLUMN password_hash TEXT;`);
+  console.log('Added password_hash column to users');
+}
+
+// Auth: add username column to users table
+if (!userColumns.includes('username')) {
+  db.exec(`ALTER TABLE users ADD COLUMN username TEXT;`);
+  console.log('Added username column to users');
+  // Backfill: set username from name (lowercased, no spaces) for existing users
+  const users = db.prepare('SELECT id, name FROM users WHERE username IS NULL').all();
+  const updateUsername = db.prepare('UPDATE users SET username = ? WHERE id = ?');
+  for (const u of users) {
+    if (u.name) {
+      const uname = u.name.toLowerCase().replace(/\s+/g, '');
+      updateUsername.run(uname, u.id);
+    }
+  }
+  console.log(`Backfilled usernames for ${users.length} users`);
+}
+
+// Elite Vault PIN storage (user-level)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS user_settings (
+    user_id INTEGER PRIMARY KEY DEFAULT 1,
+    elite_pin TEXT,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
 
 // Create default user if not exists
 const defaultUser = db.prepare('SELECT id FROM users WHERE id = 1').get();
 if (!defaultUser) {
   db.prepare('INSERT INTO users (id, email, name) VALUES (1, ?, ?)').run('default@aovault.app', 'Default User');
 }
+
+// Seed default smart collections
+const existingCollections = db.prepare('SELECT COUNT(*) as count FROM collections WHERE user_id = 1').get();
+if (existingCollections.count === 0) {
+  const insertCollection = db.prepare(
+    'INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (1, ?, ?, 1, ?, ?)'
+  );
+  insertCollection.run('All Fics', '📖', '{"type":"all"}', 0);
+  insertCollection.run('Favorites', '❤️', '{"type":"favorites"}', 1);
+  insertCollection.run('Currently Reading', '📕', '{"type":"reading"}', 2);
+  insertCollection.run('WIPs', '🚧', '{"type":"wip"}', 3);
+  insertCollection.run('Complete', '✅', '{"type":"complete"}', 4);
+  console.log('Default smart collections created');
+}
+
+// Seed reaction types
+const existingReactions = db.prepare('SELECT COUNT(*) as count FROM reaction_types').get();
+if (existingReactions.count === 0) {
+  const insertReaction = db.prepare(
+    'INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)'
+  );
+  insertReaction.run('smut', '🔥', 'SMUT', 1);
+  insertReaction.run('pwp', '🍆', 'PWP', 2);
+  insertReaction.run('destroyed', '😭', 'Destroyed Me', 3);
+  insertReaction.run('soft', '🥺', 'So Soft', 4);
+  insertReaction.run('feral', '🦝', 'Feral', 5);
+  insertReaction.run('dead', '💀', 'I Am Deceased', 6);
+  insertReaction.run('scream', '😱', 'SCREAMING', 7);
+  insertReaction.run('genius', '🧠', 'Literary Genius', 8);
+  insertReaction.run('horny', '🥵', 'Insanely Horny', 9);
+  insertReaction.run('thanks', '🙏', 'Giving Thanks', 10);
+  insertReaction.run('reread', '🔁', 'Will Reread', 11);
+  insertReaction.run('comfort', '🧸', 'Comfort Fic', 12);
+  console.log('Default reaction types seeded');
+}
+
+// Add new reaction types if they don't exist yet (for existing databases)
+const newReactions = [
+  ['horny', '🥵', 'Insanely Horny', 9],
+  ['thanks', '🙏', 'Giving Thanks', 10],
+  ['reread', '🔁', 'Will Reread', 11],
+  ['comfort', '🧸', 'Comfort Fic', 12],
+];
+const insertIfNew = db.prepare(
+  'INSERT OR IGNORE INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)'
+);
+newReactions.forEach(r => insertIfNew.run(...r));
+
+// =====================================
+// AUTH MIDDLEWARE
+// =====================================
+
+// JWT auth — no token = guest (userId 1), bad token = guest (never 401)
+const authMiddleware = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    req.userId = 1; // Guest mode
+    return next();
+  }
+  const token = authHeader.replace('Bearer ', '');
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.userId;
+  } catch {
+    req.userId = 1; // Expired/invalid = guest
+  }
+  next();
+};
+
+// Apply auth to all /api routes
+app.use('/api', authMiddleware);
+
+// =====================================
+// AUTH ROUTES
+// =====================================
+
+// Sign up
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const { username, email, password, name } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
+    if (username.length < 3) {
+      return res.status(400).json({ error: 'Username must be at least 3 characters' });
+    }
+    if (password.length < 4) {
+      return res.status(400).json({ error: 'Password must be at least 4 characters' });
+    }
+
+    // Check if username taken
+    const existingUsername = db.prepare('SELECT id FROM users WHERE LOWER(username) = ?').get(username.toLowerCase());
+    if (existingUsername) {
+      return res.status(409).json({ error: 'That username is taken' });
+    }
+
+    // Check if email taken (if provided)
+    if (email) {
+      const existingEmail = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
+      if (existingEmail) {
+        return res.status(409).json({ error: 'An account with this email already exists' });
+      }
+    }
+
+    // Hash password and create user
+    const passwordHash = await bcrypt.hash(password, 10);
+    const result = db.prepare(
+      'INSERT INTO users (username, email, name, password_hash) VALUES (?, ?, ?, ?)'
+    ).run(username.toLowerCase(), email ? email.toLowerCase() : null, name || username, passwordHash);
+
+    const userId = result.lastInsertRowid;
+
+    // Create default smart collections for this user
+    const insertCol = db.prepare(
+      'INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (?, ?, ?, 1, ?, ?)'
+    );
+    insertCol.run(userId, 'All Fics', '📖', '{"type":"all"}', 0);
+    insertCol.run(userId, 'Favorites', '❤️', '{"type":"favorites"}', 1);
+    insertCol.run(userId, 'Currently Reading', '📕', '{"type":"reading"}', 2);
+    insertCol.run(userId, 'WIPs', '🚧', '{"type":"wip"}', 3);
+    insertCol.run(userId, 'Complete', '✅', '{"type":"complete"}', 4);
+
+    // Create user_settings row
+    db.prepare('INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)').run(userId);
+
+    // Generate JWT (30-day expiry)
+    const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '30d' });
+
+    const user = db.prepare('SELECT id, username, email, name, created_at FROM users WHERE id = ?').get(userId);
+    res.status(201).json({ token, user });
+  } catch (error) {
+    console.error('Signup error:', error);
+    res.status(500).json({ error: 'Failed to create account' });
+  }
+});
+
+// Login — accepts username or email
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
+
+    // Try username first, then email
+    const input = username.toLowerCase();
+    let user = db.prepare('SELECT * FROM users WHERE LOWER(username) = ?').get(input);
+    if (!user) {
+      user = db.prepare('SELECT * FROM users WHERE email = ?').get(input);
+    }
+
+    if (!user || !user.password_hash) {
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
+
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
+
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
+
+    res.json({
+      token,
+      user: { id: user.id, username: user.username, email: user.email, name: user.name, created_at: user.created_at },
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Failed to log in' });
+  }
+});
+
+// Get current user
+app.get('/api/auth/me', (req, res) => {
+  if (req.userId === 1) {
+    return res.json({ user: null, isGuest: true });
+  }
+  const user = db.prepare('SELECT id, username, email, name, created_at FROM users WHERE id = ?').get(req.userId);
+  if (!user) {
+    return res.json({ user: null, isGuest: true });
+  }
+  res.json({ user, isGuest: false });
+});
+
+// Migrate guest data to authenticated user
+app.post('/api/auth/migrate', (req, res) => {
+  if (req.userId === 1) {
+    return res.status(400).json({ error: 'Must be logged in to migrate data' });
+  }
+
+  const migrate = db.transaction(() => {
+    // Move guest fics to the new user
+    db.prepare('UPDATE fics SET user_id = ? WHERE user_id = 1').run(req.userId);
+    // Move guest collections (non-smart only — smart ones were already created for the user)
+    db.prepare('UPDATE collections SET user_id = ? WHERE user_id = 1 AND is_smart = 0').run(req.userId);
+    // Move reading history
+    db.prepare('UPDATE reading_history SET user_id = ? WHERE user_id = 1').run(req.userId);
+    // Copy user_settings (elite PIN)
+    const guestSettings = db.prepare('SELECT elite_pin FROM user_settings WHERE user_id = 1').get();
+    if (guestSettings?.elite_pin) {
+      db.prepare('UPDATE user_settings SET elite_pin = ? WHERE user_id = ?').run(guestSettings.elite_pin, req.userId);
+    }
+  });
+
+  try {
+    migrate();
+    const ficCount = db.prepare('SELECT COUNT(*) as count FROM fics WHERE user_id = ?').get(req.userId).count;
+    res.json({ message: 'Guest data migrated to your account', ficsMigrated: ficCount });
+  } catch (error) {
+    console.error('Migration error:', error);
+    res.status(500).json({ error: 'Failed to migrate data' });
+  }
+});
 
 // =====================================
 // AO3 PARSER
@@ -108,7 +506,7 @@ async function parseAO3Work(url) {
     const workId = match[1];
 
     // Fetch the page
-    const response = await axios.get(url, {
+    const response = await getAxios().get(url, {
       headers: {
         'User-Agent': 'AOVault/1.0 (Personal Fanfiction Library)',
         'Accept': 'text/html,application/xhtml+xml',
@@ -116,41 +514,42 @@ async function parseAO3Work(url) {
       timeout: 10000,
     });
 
-    const $ = cheerio.load(response.data);
+    const root = getParseHTML()(response.data);
+
+    // Helper: get text content of all matching links inside a dd element
+    const getLinksText = (selector) => {
+      const el = root.querySelector(selector);
+      if (!el) return [];
+      return el.querySelectorAll('a').map(a => a.text.trim()).filter(Boolean);
+    };
 
     // Extract metadata
-    const title = $('h2.title').text().trim();
-    const author = $('a[rel="author"]').first().text().trim();
-    const authorUrl = $('a[rel="author"]').first().attr('href');
+    const title = (root.querySelector('h2.title')?.text || '').trim();
+    const authorEl = root.querySelector('a[rel="author"]');
+    const author = authorEl ? authorEl.text.trim() : '';
+    const authorUrl = authorEl ? authorEl.getAttribute('href') : null;
 
     // Rating
-    const rating = $('dd.rating').text().trim();
+    const rating = (root.querySelector('dd.rating')?.text || '').trim();
 
-    // Warnings
-    const warnings = $('dd.warning').find('a').map((i, el) => $(el).text().trim()).get();
-
-    // Fandoms
-    const fandoms = $('dd.fandom').find('a').map((i, el) => $(el).text().trim()).get();
-
-    // Relationships (ships)
-    const ships = $('dd.relationship').find('a').map((i, el) => $(el).text().trim()).get();
-
-    // Characters
-    const characters = $('dd.character').find('a').map((i, el) => $(el).text().trim()).get();
-
-    // Tags
-    const tags = $('dd.freeform').find('a').map((i, el) => $(el).text().trim()).get();
+    // Warnings, Fandoms, Ships, Characters, Tags, Categories
+    const warnings = getLinksText('dd.warning');
+    const fandoms = getLinksText('dd.fandom');
+    const ships = getLinksText('dd.relationship');
+    const characters = getLinksText('dd.character');
+    const tags = getLinksText('dd.freeform');
+    const categories = getLinksText('dd.category');
 
     // Language
-    const language = $('dd.language').text().trim();
+    const language = (root.querySelector('dd.language')?.text || '').trim();
 
-    // Stats
-    const statsText = $('dd.stats').text();
-    const wordCountMatch = $('dd.words').text().match(/[\d,]+/);
+    // Word count
+    const wordsText = root.querySelector('dd.words')?.text || '';
+    const wordCountMatch = wordsText.match(/[\d,]+/);
     const wordCount = wordCountMatch ? parseInt(wordCountMatch[0].replace(/,/g, '')) : 0;
 
     // Chapters
-    const chapterText = $('dd.chapters').text().trim();
+    const chapterText = (root.querySelector('dd.chapters')?.text || '').trim();
     const chapterMatch = chapterText.match(/(\d+)\/(\d+|\?)/);
     const chapterCount = chapterMatch ? parseInt(chapterMatch[1]) : 1;
     const chapterTotal = chapterMatch && chapterMatch[2] !== '?' ? parseInt(chapterMatch[2]) : null;
@@ -159,14 +558,12 @@ async function parseAO3Work(url) {
     const status = chapterTotal && chapterCount >= chapterTotal ? 'Complete' : 'WIP';
 
     // Dates
-    const published = $('dd.published').text().trim();
-    const updated = $('dd.status').text().trim() || published;
+    const published = (root.querySelector('dd.published')?.text || '').trim();
+    const updated = (root.querySelector('dd.status')?.text || '').trim() || published;
 
     // Summary
-    const summary = $('div.summary blockquote').text().trim();
-
-    // Categories
-    const categories = $('dd.category').find('a').map((i, el) => $(el).text().trim()).get();
+    const summaryBlock = root.querySelector('div.summary blockquote');
+    const summary = summaryBlock ? summaryBlock.text.trim() : '';
 
     return {
       source: 'ao3',
@@ -204,7 +601,7 @@ async function downloadAO3Epub(workId, userId = 1) {
   const epubUrl = `https://archiveofourown.org/downloads/${workId}/work.epub`;
 
   try {
-    const response = await axios.get(epubUrl, {
+    const response = await getAxios().get(epubUrl, {
       responseType: 'arraybuffer',
       headers: {
         'User-Agent': 'AOVault/1.0 (Personal Fanfiction Library)',
@@ -242,7 +639,7 @@ app.get('/api/health', (req, res) => {
 app.post('/api/fics/import', async (req, res) => {
   try {
     const { url } = req.body;
-    const userId = 1; // Default user for now
+    const userId = req.userId;
 
     if (!url) {
       return res.status(400).json({ error: 'URL is required' });
@@ -260,11 +657,16 @@ app.post('/api/fics/import', async (req, res) => {
 
     // Check if already saved
     const existing = db.prepare(
-      'SELECT id FROM fics WHERE user_id = ? AND source = ? AND source_id = ?'
+      'SELECT id, title FROM fics WHERE user_id = ? AND source = ? AND source_id = ?'
     ).get(userId, ficData.source, ficData.source_id);
 
     if (existing) {
-      return res.status(409).json({ error: 'This fic is already in your vault', ficId: existing.id });
+      return res.status(409).json({
+        error: 'This fic is already in your vault',
+        ficId: existing.id,
+        title: existing.title,
+        alreadySaved: true
+      });
     }
 
     // Download epub
@@ -308,7 +710,7 @@ app.post('/api/fics/import', async (req, res) => {
 
 // Get all fics for user
 app.get('/api/fics', (req, res) => {
-  const userId = 1; // Default user for now
+  const userId = req.userId;
   const { search, fandom, ship, status, rating, sort } = req.query;
 
   let query = 'SELECT * FROM fics WHERE user_id = ?';
@@ -379,10 +781,11 @@ app.get('/api/fics/:id', (req, res) => {
   res.json({ fic });
 });
 
-// Update fic (notes, personal tags, favorite, read status)
+// Update fic (notes, personal tags, favorite, read status, elite vault, notifications)
 app.patch('/api/fics/:id', (req, res) => {
   const { id } = req.params;
-  const { notes, personal_tags, favorite, read_status, read_progress } = req.body;
+  const { notes, personal_tags, favorite, read_status, read_progress,
+          in_elite_vault, times_read, notify_on_complete, binge_threshold } = req.body;
 
   const updates = [];
   const params = [];
@@ -406,6 +809,22 @@ app.patch('/api/fics/:id', (req, res) => {
   if (read_progress !== undefined) {
     updates.push('read_progress = ?');
     params.push(read_progress);
+  }
+  if (in_elite_vault !== undefined) {
+    updates.push('in_elite_vault = ?');
+    params.push(in_elite_vault ? 1 : 0);
+  }
+  if (times_read !== undefined) {
+    updates.push('times_read = ?');
+    params.push(parseInt(times_read) || 0);
+  }
+  if (notify_on_complete !== undefined) {
+    updates.push('notify_on_complete = ?');
+    params.push(notify_on_complete ? 1 : 0);
+  }
+  if (binge_threshold !== undefined) {
+    updates.push('binge_threshold = ?');
+    params.push(parseInt(binge_threshold) || 0);
   }
 
   if (updates.length === 0) {
@@ -443,7 +862,7 @@ app.delete('/api/fics/:id', (req, res) => {
 
 // Get stats
 app.get('/api/stats', (req, res) => {
-  const userId = 1;
+  const userId = req.userId;
 
   const totalFics = db.prepare('SELECT COUNT(*) as count FROM fics WHERE user_id = ?').get(userId).count;
   const totalWords = db.prepare('SELECT SUM(word_count) as total FROM fics WHERE user_id = ?').get(userId).total || 0;
@@ -498,9 +917,746 @@ app.get('/api/fics/:id/epub', (req, res) => {
   res.sendFile(fic.epub_path);
 });
 
-// Start server - bind to all interfaces for mobile access
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`AOVault API running on port ${PORT}`);
+// =====================================
+// COLLECTIONS API
+// =====================================
+
+// Get all collections with fic counts
+app.get('/api/collections', (req, res) => {
+  const userId = req.userId;
+
+  const collections = db.prepare(`
+    SELECT c.*,
+      CASE
+        WHEN c.is_smart = 1 THEN (
+          CASE json_extract(c.smart_rules, '$.type')
+            WHEN 'all' THEN (SELECT COUNT(*) FROM fics WHERE user_id = ?)
+            WHEN 'favorites' THEN (SELECT COUNT(*) FROM fics WHERE user_id = ? AND favorite = 1)
+            WHEN 'reading' THEN (SELECT COUNT(*) FROM fics WHERE user_id = ? AND read_status = 'reading')
+            WHEN 'wip' THEN (SELECT COUNT(*) FROM fics WHERE user_id = ? AND status = 'WIP')
+            WHEN 'complete' THEN (SELECT COUNT(*) FROM fics WHERE user_id = ? AND status = 'Complete')
+            ELSE 0
+          END
+        )
+        ELSE (SELECT COUNT(*) FROM collection_fics WHERE collection_id = c.id)
+      END as fic_count
+    FROM collections c
+    WHERE c.user_id = ?
+    ORDER BY c.position ASC
+  `).all(userId, userId, userId, userId, userId, userId);
+
+  res.json({ collections });
+});
+
+// Create a custom collection
+app.post('/api/collections', (req, res) => {
+  const userId = req.userId;
+  const { name, description, icon } = req.body;
+
+  if (!name) {
+    return res.status(400).json({ error: 'Collection name is required' });
+  }
+
+  // Get next position
+  const maxPos = db.prepare(
+    'SELECT MAX(position) as maxPos FROM collections WHERE user_id = ?'
+  ).get(userId);
+  const position = (maxPos?.maxPos ?? -1) + 1;
+
+  const result = db.prepare(
+    'INSERT INTO collections (user_id, name, description, icon, is_smart, position) VALUES (?, ?, ?, ?, 0, ?)'
+  ).run(userId, name, description || null, icon || '📚', position);
+
+  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(result.lastInsertRowid);
+
+  res.status(201).json({ collection });
+});
+
+// Update a collection
+app.patch('/api/collections/:id', (req, res) => {
+  const { id } = req.params;
+  const { name, description, icon } = req.body;
+
+  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  if (!collection) {
+    return res.status(404).json({ error: 'Collection not found' });
+  }
+  if (collection.is_smart) {
+    return res.status(400).json({ error: 'Cannot edit smart collections' });
+  }
+
+  const updates = [];
+  const params = [];
+  if (name !== undefined) { updates.push('name = ?'); params.push(name); }
+  if (description !== undefined) { updates.push('description = ?'); params.push(description); }
+  if (icon !== undefined) { updates.push('icon = ?'); params.push(icon); }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'No updates provided' });
+  }
+
+  params.push(id);
+  db.prepare(`UPDATE collections SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  const updated = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  res.json({ collection: updated });
+});
+
+// Delete a custom collection
+app.delete('/api/collections/:id', (req, res) => {
+  const { id } = req.params;
+
+  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  if (!collection) {
+    return res.status(404).json({ error: 'Collection not found' });
+  }
+  if (collection.is_smart) {
+    return res.status(400).json({ error: 'Cannot delete smart collections' });
+  }
+
+  db.prepare('DELETE FROM collection_fics WHERE collection_id = ?').run(id);
+  db.prepare('DELETE FROM collections WHERE id = ?').run(id);
+  res.json({ message: 'Collection deleted' });
+});
+
+// Get fics in a collection
+app.get('/api/collections/:id/fics', (req, res) => {
+  const userId = req.userId;
+  const { id } = req.params;
+
+  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  if (!collection) {
+    return res.status(404).json({ error: 'Collection not found' });
+  }
+
+  let fics;
+  if (collection.is_smart) {
+    const rules = JSON.parse(collection.smart_rules || '{}');
+    switch (rules.type) {
+      case 'all':
+        fics = db.prepare('SELECT * FROM fics WHERE user_id = ? ORDER BY date_added DESC').all(userId);
+        break;
+      case 'favorites':
+        fics = db.prepare('SELECT * FROM fics WHERE user_id = ? AND favorite = 1 ORDER BY date_added DESC').all(userId);
+        break;
+      case 'reading':
+        fics = db.prepare("SELECT * FROM fics WHERE user_id = ? AND read_status = 'reading' ORDER BY date_added DESC").all(userId);
+        break;
+      case 'wip':
+        fics = db.prepare("SELECT * FROM fics WHERE user_id = ? AND status = 'WIP' ORDER BY date_added DESC").all(userId);
+        break;
+      case 'complete':
+        fics = db.prepare("SELECT * FROM fics WHERE user_id = ? AND status = 'Complete' ORDER BY date_added DESC").all(userId);
+        break;
+      default:
+        fics = [];
+    }
+  } else {
+    fics = db.prepare(`
+      SELECT f.* FROM fics f
+      JOIN collection_fics cf ON f.id = cf.fic_id
+      WHERE cf.collection_id = ?
+      ORDER BY cf.added_at DESC
+    `).all(id);
+  }
+
+  res.json({ fics, count: fics.length, collection });
+});
+
+// Add fic to a collection
+app.post('/api/collections/:id/fics/:ficId', (req, res) => {
+  const { id, ficId } = req.params;
+
+  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  if (!collection) {
+    return res.status(404).json({ error: 'Collection not found' });
+  }
+  if (collection.is_smart) {
+    return res.status(400).json({ error: 'Cannot manually add fics to smart collections' });
+  }
+
+  const fic = db.prepare('SELECT * FROM fics WHERE id = ?').get(ficId);
+  if (!fic) {
+    return res.status(404).json({ error: 'Fic not found' });
+  }
+
+  // Check if already in collection
+  const existing = db.prepare(
+    'SELECT * FROM collection_fics WHERE collection_id = ? AND fic_id = ?'
+  ).get(id, ficId);
+  if (existing) {
+    return res.status(409).json({ error: 'Fic already in this collection' });
+  }
+
+  db.prepare('INSERT INTO collection_fics (collection_id, fic_id) VALUES (?, ?)').run(id, ficId);
+  res.status(201).json({ message: 'Fic added to collection' });
+});
+
+// Remove fic from a collection
+app.delete('/api/collections/:id/fics/:ficId', (req, res) => {
+  const { id, ficId } = req.params;
+
+  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  if (!collection) {
+    return res.status(404).json({ error: 'Collection not found' });
+  }
+  if (collection.is_smart) {
+    return res.status(400).json({ error: 'Cannot manually remove fics from smart collections' });
+  }
+
+  db.prepare('DELETE FROM collection_fics WHERE collection_id = ? AND fic_id = ?').run(id, ficId);
+  res.json({ message: 'Fic removed from collection' });
+});
+
+// =====================================
+// REACTIONS
+// =====================================
+
+// Get all reaction types
+app.get('/api/reactions/types', (req, res) => {
+  const types = db.prepare('SELECT * FROM reaction_types ORDER BY position').all();
+  res.json({ types });
+});
+
+// Get reactions for a fic
+app.get('/api/fics/:id/reactions', (req, res) => {
+  const { id } = req.params;
+  const reactions = db.prepare(`
+    SELECT fr.*, rt.emoji, rt.label
+    FROM fic_reactions fr
+    JOIN reaction_types rt ON fr.reaction_code = rt.code
+    WHERE fr.fic_id = ?
+    ORDER BY fr.created_at DESC
+  `).all(id);
+  res.json({ reactions });
+});
+
+// Add a reaction to a fic
+app.post('/api/fics/:id/reactions', (req, res) => {
+  const { id } = req.params;
+  const { reaction_code, intensity = 3, chapter_number, note } = req.body;
+
+  if (!reaction_code) {
+    return res.status(400).json({ error: 'reaction_code is required' });
+  }
+
+  // Validate reaction type exists
+  const reactionType = db.prepare('SELECT * FROM reaction_types WHERE code = ?').get(reaction_code);
+  if (!reactionType) {
+    return res.status(400).json({ error: 'Invalid reaction code' });
+  }
+
+  // Validate fic exists
+  const fic = db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
+  if (!fic) {
+    return res.status(404).json({ error: 'Fic not found' });
+  }
+
+  // Validate intensity
+  const validIntensity = Math.max(1, Math.min(5, parseInt(intensity) || 3));
+
+  const result = db.prepare(`
+    INSERT INTO fic_reactions (fic_id, reaction_code, intensity, chapter_number, note)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(id, reaction_code, validIntensity, chapter_number || null, note || null);
+
+  const reaction = db.prepare(`
+    SELECT fr.*, rt.emoji, rt.label
+    FROM fic_reactions fr
+    JOIN reaction_types rt ON fr.reaction_code = rt.code
+    WHERE fr.id = ?
+  `).get(result.lastInsertRowid);
+
+  res.status(201).json({ reaction });
+});
+
+// Update a reaction
+app.patch('/api/reactions/:id', (req, res) => {
+  const { id } = req.params;
+  const { intensity, note } = req.body;
+
+  const existing = db.prepare('SELECT * FROM fic_reactions WHERE id = ?').get(id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Reaction not found' });
+  }
+
+  const updates = [];
+  const values = [];
+
+  if (intensity !== undefined) {
+    updates.push('intensity = ?');
+    values.push(Math.max(1, Math.min(5, parseInt(intensity) || 3)));
+  }
+  if (note !== undefined) {
+    updates.push('note = ?');
+    values.push(note);
+  }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'No fields to update' });
+  }
+
+  values.push(id);
+  db.prepare(`UPDATE fic_reactions SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+
+  const reaction = db.prepare(`
+    SELECT fr.*, rt.emoji, rt.label
+    FROM fic_reactions fr
+    JOIN reaction_types rt ON fr.reaction_code = rt.code
+    WHERE fr.id = ?
+  `).get(id);
+
+  res.json({ reaction });
+});
+
+// Delete a reaction
+app.delete('/api/reactions/:id', (req, res) => {
+  const { id } = req.params;
+
+  const existing = db.prepare('SELECT * FROM fic_reactions WHERE id = ?').get(id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Reaction not found' });
+  }
+
+  db.prepare('DELETE FROM fic_reactions WHERE id = ?').run(id);
+  res.json({ message: 'Reaction removed' });
+});
+
+// =====================================
+// ELITE VAULT
+// =====================================
+
+// Get elite vault PIN status (has PIN been set?)
+app.get('/api/elite-vault/status', (req, res) => {
+  const settings = db.prepare('SELECT elite_pin FROM user_settings WHERE user_id = ?').get(req.userId);
+  res.json({ hasPin: !!(settings && settings.elite_pin) });
+});
+
+// Set or update elite vault PIN
+app.post('/api/elite-vault/pin', (req, res) => {
+  const { pin } = req.body;
+  if (!pin || pin.length < 4) {
+    return res.status(400).json({ error: 'PIN must be at least 4 characters' });
+  }
+
+  const existing = db.prepare('SELECT * FROM user_settings WHERE user_id = ?').get(req.userId);
+  if (existing) {
+    db.prepare('UPDATE user_settings SET elite_pin = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?').run(pin, req.userId);
+  } else {
+    db.prepare('INSERT INTO user_settings (user_id, elite_pin) VALUES (?, ?)').run(req.userId, pin);
+  }
+
+  res.json({ message: 'PIN set successfully' });
+});
+
+// Verify elite vault PIN
+app.post('/api/elite-vault/verify', (req, res) => {
+  const { pin } = req.body;
+  const settings = db.prepare('SELECT elite_pin FROM user_settings WHERE user_id = ?').get(req.userId);
+
+  if (!settings || !settings.elite_pin) {
+    return res.json({ valid: true, noPinSet: true });
+  }
+
+  res.json({ valid: pin === settings.elite_pin });
+});
+
+// Get all elite vault fics
+app.get('/api/elite-vault', (req, res) => {
+  const fics = db.prepare(
+    'SELECT * FROM fics WHERE user_id = ? AND in_elite_vault = 1 ORDER BY date_added DESC'
+  ).all(req.userId);
+  res.json({ fics, count: fics.length });
+});
+
+// Add fic to elite vault
+app.post('/api/fics/:id/elite-vault', (req, res) => {
+  const { id } = req.params;
+  const { force } = req.body;
+
+  const fic = db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
+  if (!fic) {
+    return res.status(404).json({ error: 'Fic not found' });
+  }
+
+  // Check qualification: 5+ reads OR force add
+  if (!force && (fic.times_read || 0) < 5) {
+    return res.status(400).json({
+      error: 'Fic needs 5+ reads to qualify for Elite Vault, or use force add',
+      times_read: fic.times_read || 0,
+      needed: 5,
+    });
+  }
+
+  db.prepare('UPDATE fics SET in_elite_vault = 1 WHERE id = ?').run(id);
+  const updated = db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
+  res.json({ message: 'Added to Elite Vault', fic: updated });
+});
+
+// Remove from elite vault
+app.delete('/api/fics/:id/elite-vault', (req, res) => {
+  const { id } = req.params;
+  db.prepare('UPDATE fics SET in_elite_vault = 0 WHERE id = ?').run(id);
+  res.json({ message: 'Removed from Elite Vault' });
+});
+
+// Increment times read
+app.post('/api/fics/:id/read-count', (req, res) => {
+  const { id } = req.params;
+  db.prepare('UPDATE fics SET times_read = COALESCE(times_read, 0) + 1 WHERE id = ?').run(id);
+  const fic = db.prepare('SELECT id, times_read, in_elite_vault FROM fics WHERE id = ?').get(id);
+  res.json({
+    times_read: fic.times_read,
+    qualifies_for_elite: fic.times_read >= 5,
+    in_elite_vault: !!fic.in_elite_vault,
+  });
+});
+
+// =====================================
+// NOTIFICATION SETTINGS
+// =====================================
+
+// Get notification settings for a fic
+app.get('/api/fics/:id/notifications', (req, res) => {
+  const { id } = req.params;
+  const fic = db.prepare(
+    'SELECT id, notify_on_complete, binge_threshold, status, chapter_count, chapter_total, last_checked_at FROM fics WHERE id = ?'
+  ).get(id);
+
+  if (!fic) {
+    return res.status(404).json({ error: 'Fic not found' });
+  }
+
+  res.json({
+    notify_on_complete: !!fic.notify_on_complete,
+    binge_threshold: fic.binge_threshold || 0,
+    status: fic.status,
+    chapter_count: fic.chapter_count,
+    chapter_total: fic.chapter_total,
+    last_checked_at: fic.last_checked_at,
+  });
+});
+
+// Update notification settings for a fic
+app.patch('/api/fics/:id/notifications', (req, res) => {
+  const { id } = req.params;
+  const { notify_on_complete, binge_threshold } = req.body;
+
+  const updates = [];
+  const params = [];
+
+  if (notify_on_complete !== undefined) {
+    updates.push('notify_on_complete = ?');
+    params.push(notify_on_complete ? 1 : 0);
+  }
+  if (binge_threshold !== undefined) {
+    updates.push('binge_threshold = ?');
+    params.push(parseInt(binge_threshold) || 0);
+  }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'No updates provided' });
+  }
+
+  params.push(id);
+  db.prepare(`UPDATE fics SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+
+  res.json({ message: 'Notification settings updated' });
+});
+
+// Check for fic updates (re-scrape AO3 for WIPs)
+app.post('/api/fics/check-updates', async (req, res) => {
+  const wips = db.prepare(
+    "SELECT * FROM fics WHERE user_id = ? AND status = 'WIP' AND source = 'ao3'"
+  ).all(req.userId);
+
+  const results = [];
+
+  for (const fic of wips) {
+    try {
+      const updated = await parseAO3Work(fic.source_url);
+
+      const changes = {};
+      if (updated.chapter_count !== fic.chapter_count) {
+        changes.new_chapters = updated.chapter_count - fic.chapter_count;
+      }
+      if (updated.status !== fic.status) {
+        changes.status_changed = { from: fic.status, to: updated.status };
+      }
+      if (updated.word_count !== fic.word_count) {
+        changes.word_count_change = updated.word_count - fic.word_count;
+      }
+
+      if (Object.keys(changes).length > 0) {
+        // Update the fic in database
+        db.prepare(`
+          UPDATE fics SET
+            chapter_count = ?, chapter_total = ?, word_count = ?,
+            status = ?, updated_at = ?, last_checked_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).run(
+          updated.chapter_count, updated.chapter_total, updated.word_count,
+          updated.status, updated.updated_at, fic.id
+        );
+
+        results.push({
+          id: fic.id,
+          title: fic.title,
+          changes,
+          notify: fic.notify_on_complete && updated.status === 'Complete',
+          binge_ready: fic.binge_threshold > 0 && changes.new_chapters >= fic.binge_threshold,
+        });
+      } else {
+        db.prepare('UPDATE fics SET last_checked_at = CURRENT_TIMESTAMP WHERE id = ?').run(fic.id);
+      }
+    } catch (err) {
+      results.push({ id: fic.id, title: fic.title, error: err.message });
+    }
+  }
+
+  res.json({ checked: wips.length, updates: results });
+});
+
+// =====================================
+// OFFLINE READING - FETCH FULL TEXT
+// =====================================
+
+// Fetch full fic content from AO3 for offline reading on device
+app.get('/api/fics/:id/content', async (req, res) => {
+  const { id } = req.params;
+  const userId = req.userId;
+
+  const fic = db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
+  if (!fic) {
+    return res.status(404).json({ error: 'Fic not found' });
+  }
+
+  if (fic.source !== 'ao3') {
+    return res.status(400).json({ error: 'Only AO3 fics supported for now' });
+  }
+
+  try {
+    await ao3RateLimit();
+
+    // Fetch full work page (all chapters on one page)
+    const fullUrl = `https://archiveofourown.org/works/${fic.source_id}?view_full_work=true&view_adult=true`;
+    const response = await getAxios().get(fullUrl, {
+      headers: {
+        'User-Agent': 'AOVault/1.0 (Personal Fanfiction Library)',
+        'Accept': 'text/html,application/xhtml+xml',
+      },
+      timeout: 60000,
+    });
+
+    if (response.status === 429) {
+      return res.status(429).json({ error: 'AO3 rate limit. Try again in a minute.' });
+    }
+
+    const root = getParseHTML()(response.data);
+
+    // Extract chapter content
+    const chapters = [];
+    const chapterDivs = root.querySelectorAll('div#chapters > div.chapter') || [];
+
+    if (chapterDivs.length > 0) {
+      // Multi-chapter fic — only grab top-level chapter divs
+      chapterDivs.forEach((div) => {
+        const userstuff = div.querySelector('div.userstuff[role="article"]') || div.querySelector('div.userstuff');
+        const html = userstuff ? userstuff.innerHTML.trim() : '';
+        // Skip empty chapter divs (AO3 has preface/group wrappers)
+        if (!html) return;
+        const titleEl = div.querySelector('h3.title a') || div.querySelector('h3.title');
+        const title = titleEl ? titleEl.text.trim() : `Chapter ${chapters.length + 1}`;
+        chapters.push({ number: chapters.length + 1, title, html });
+      });
+    } else {
+      // Single-chapter fic
+      const userstuff = root.querySelector('div.userstuff[role="article"]') ||
+                        root.querySelector('div#chapters div.userstuff') ||
+                        root.querySelector('div.userstuff');
+      const html = userstuff ? userstuff.innerHTML.trim() : '';
+      chapters.push({ number: 1, title: fic.title, html });
+    }
+
+    // Extract author notes if present
+    const preNote = root.querySelector('div.preface div.notes div.userstuff');
+    const endNote = root.querySelector('div.end.notes div.userstuff');
+
+    res.json({
+      id: fic.id,
+      title: fic.title,
+      author: fic.author,
+      chapters,
+      preNote: preNote ? preNote.innerHTML.trim() : null,
+      endNote: endNote ? endNote.innerHTML.trim() : null,
+      fetchedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Content fetch error:', error.message);
+    res.status(500).json({ error: `Failed to fetch content: ${error.message}` });
+  }
+});
+
+// =====================================
+// OFFLINE DOWNLOADS
+// =====================================
+
+// Download a fic from AO3 for offline reading
+app.post('/api/fics/:id/download', async (req, res) => {
+  const { id } = req.params;
+  const { format = 'epub' } = req.body;
+  const userId = req.userId;
+
+  const validFormats = ['epub', 'pdf', 'html', 'mobi'];
+  if (!validFormats.includes(format)) {
+    return res.status(400).json({ error: `Invalid format. Choose: ${validFormats.join(', ')}` });
+  }
+
+  const fic = db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
+  if (!fic) {
+    return res.status(404).json({ error: 'Fic not found' });
+  }
+
+  if (fic.download_status === 'downloaded' && fic.download_format === format) {
+    return res.json({ message: 'Already downloaded', fic });
+  }
+
+  // Mark as downloading
+  db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('downloading', id);
+
+  try {
+    // Rate limit AO3 requests
+    await ao3RateLimit();
+
+    // Use AO3's official download URL
+    const slug = fic.title.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 50);
+    const downloadUrl = `https://archiveofourown.org/downloads/${fic.source_id}/${slug}.${format}`;
+
+    const response = await getAxios().get(downloadUrl, {
+      responseType: 'arraybuffer',
+      headers: {
+        'User-Agent': 'AOVault/1.0 (personal offline reader; contact@aovault.app)',
+      },
+      timeout: 60000,
+      validateStatus: (status) => status < 500,
+    });
+
+    if (response.status === 429) {
+      db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('none', id);
+      return res.status(429).json({ error: 'AO3 rate limit hit. Please try again in a minute.' });
+    }
+
+    if (response.status !== 200) {
+      db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('failed', id);
+      return res.status(502).json({ error: `AO3 returned status ${response.status}` });
+    }
+
+    // Save file
+    const downloadDir = path.join(__dirname, 'downloads', String(userId));
+    if (!fs.existsSync(downloadDir)) {
+      fs.mkdirSync(downloadDir, { recursive: true });
+    }
+
+    const filePath = path.join(downloadDir, `${fic.source_id}.${format}`);
+    fs.writeFileSync(filePath, response.data);
+
+    const fileSize = response.data.length;
+
+    // Update database
+    db.prepare(`
+      UPDATE fics SET
+        download_status = 'downloaded',
+        download_format = ?,
+        download_path = ?,
+        downloaded_at = CURRENT_TIMESTAMP,
+        file_size = ?
+      WHERE id = ?
+    `).run(format, filePath, fileSize, id);
+
+    const updated = db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
+    res.json({ message: 'Download complete', fic: updated });
+  } catch (error) {
+    console.error('Download error:', error.message);
+    db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('failed', id);
+    res.status(500).json({ error: `Download failed: ${error.message}` });
+  }
+});
+
+// Serve downloaded file for offline reading
+app.get('/api/fics/:id/download/file', (req, res) => {
+  const { id } = req.params;
+  const userId = req.userId;
+
+  const fic = db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
+  if (!fic || !fic.download_path) {
+    return res.status(404).json({ error: 'No download found' });
+  }
+
+  if (!fs.existsSync(fic.download_path)) {
+    db.prepare("UPDATE fics SET download_status = 'none', download_path = NULL WHERE id = ?").run(id);
+    return res.status(404).json({ error: 'Download file missing' });
+  }
+
+  const contentTypes = {
+    epub: 'application/epub+zip',
+    pdf: 'application/pdf',
+    html: 'text/html',
+    mobi: 'application/x-mobipocket-ebook',
+  };
+
+  res.setHeader('Content-Type', contentTypes[fic.download_format] || 'application/octet-stream');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.sendFile(fic.download_path);
+});
+
+// Remove offline download
+app.delete('/api/fics/:id/download', (req, res) => {
+  const { id } = req.params;
+  const userId = req.userId;
+
+  const fic = db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
+  if (!fic) {
+    return res.status(404).json({ error: 'Fic not found' });
+  }
+
+  // Delete file if it exists
+  if (fic.download_path && fs.existsSync(fic.download_path)) {
+    fs.unlinkSync(fic.download_path);
+  }
+
+  db.prepare(`
+    UPDATE fics SET
+      download_status = 'none',
+      download_format = NULL,
+      download_path = NULL,
+      downloaded_at = NULL,
+      file_size = NULL
+    WHERE id = ?
+  `).run(id);
+
+  res.json({ message: 'Download removed' });
+});
+
+// List all downloaded fics
+app.get('/api/fics/downloaded', (req, res) => {
+  const userId = req.userId;
+  const fics = db.prepare(
+    "SELECT * FROM fics WHERE user_id = ? AND download_status = 'downloaded' ORDER BY downloaded_at DESC"
+  ).all(userId);
+  res.json({ fics, count: fics.length });
+});
+
+// In production, serve frontend for any non-API route (SPA fallback)
+if (isProduction) {
+  const frontendPath = path.join(__dirname, 'public');
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(frontendPath, 'index.html'));
+  });
+}
+
+// Start server
+const HOST = isProduction ? '0.0.0.0' : '0.0.0.0';
+app.listen(PORT, HOST, () => {
+  console.log(`AOVault API running on port ${PORT} (${isProduction ? 'production' : 'development'})`);
 });
 
 module.exports = app;

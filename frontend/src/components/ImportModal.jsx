@@ -1,12 +1,15 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import toast from 'react-hot-toast'
-import { API_URL } from '../config'
+import { API_URL, apiFetch } from '../config'
 import { CloseIcon } from './Icons'
 
 export default function ImportModal({ isOpen, onClose, onImportSuccess }) {
+  const navigate = useNavigate()
   const [url, setUrl] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [existingFic, setExistingFic] = useState(null)
 
   const handleImport = async (e) => {
     e.preventDefault()
@@ -14,17 +17,26 @@ export default function ImportModal({ isOpen, onClose, onImportSuccess }) {
 
     setLoading(true)
     setError('')
+    setExistingFic(null)
 
     const loadingToast = toast.loading('Importing from AO3...')
 
     try {
-      const response = await fetch(`${API_URL}/fics/import`, {
+      const response = await apiFetch(`${API_URL}/fics/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url }),
       })
 
       const data = await response.json()
+
+      if (response.status === 409 && data.alreadySaved) {
+        toast.dismiss(loadingToast)
+        setExistingFic({ id: data.ficId, title: data.title })
+        setError('')
+        setLoading(false)
+        return
+      }
 
       if (!response.ok) {
         throw new Error(data.error || 'Failed to import fic')
@@ -46,6 +58,7 @@ export default function ImportModal({ isOpen, onClose, onImportSuccess }) {
   const handleClose = () => {
     setUrl('')
     setError('')
+    setExistingFic(null)
     onClose()
   }
 
@@ -95,6 +108,26 @@ export default function ImportModal({ isOpen, onClose, onImportSuccess }) {
 
           {error && (
             <p className="text-red-400 text-sm mt-2 bg-red-400/10 px-3 py-2 rounded-lg">{error}</p>
+          )}
+
+          {/* Already saved — show link to existing fic */}
+          {existingFic && (
+            <div className="mt-3 p-3 bg-accent-gold/10 border border-accent-gold/30 rounded-lg">
+              <p className="text-accent-gold text-sm font-medium mb-2">
+                "{existingFic.title}" is already in your vault!
+              </p>
+              <button
+                onClick={() => {
+                  setUrl('')
+                  setExistingFic(null)
+                  onClose()
+                  navigate(`/fic/${existingFic.id}`)
+                }}
+                className="text-sm text-accent-gold hover:underline"
+              >
+                → View in your vault
+              </button>
+            </div>
           )}
 
           <div className="flex gap-3 justify-end mt-5">

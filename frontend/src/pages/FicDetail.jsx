@@ -1,11 +1,17 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
+import toast from 'react-hot-toast'
 import Header from '../components/Header'
+import ShipPill from '../components/ShipPill'
+import ReactionPicker from '../components/ReactionPicker'
+import ReactionsDisplay from '../components/ReactionsDisplay'
+import NotificationSettings from '../components/NotificationSettings'
 import {
   ArrowLeftIcon, HeartIcon, ExternalLinkIcon, BookOpenIcon,
-  EditIcon, TagIcon, TrashIcon
+  EditIcon, TagIcon, TrashIcon, DownloadIcon
 } from '../components/Icons'
-import { API_URL } from '../config'
+import { API_URL, apiFetch } from '../config'
+import { cacheFicContent, isCached, removeCachedContent } from '../utils/offlineCache'
 
 // Format word count nicely
 const formatWordCount = (count) => {
@@ -40,14 +46,20 @@ export default function FicDetail() {
   const [editingNotes, setEditingNotes] = useState(false)
   const [notes, setNotes] = useState('')
   const [personalTags, setPersonalTags] = useState('')
+  const [reactions, setReactions] = useState([])
+  const [showReactionPicker, setShowReactionPicker] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const [cachedOffline, setCachedOffline] = useState(false)
 
   useEffect(() => {
     fetchFic()
+    fetchReactions()
+    isCached(parseInt(id)).then(setCachedOffline)
   }, [id])
 
   const fetchFic = async () => {
     try {
-      const response = await fetch(`${API_URL}/fics/${id}`)
+      const response = await apiFetch(`${API_URL}/fics/${id}`)
       const data = await response.json()
       if (data.fic) {
         setFic(data.fic)
@@ -61,10 +73,28 @@ export default function FicDetail() {
     }
   }
 
+  const fetchReactions = async () => {
+    try {
+      const response = await apiFetch(`${API_URL}/fics/${id}/reactions`)
+      const data = await response.json()
+      setReactions(data.reactions || [])
+    } catch (err) {
+      console.error('Failed to fetch reactions:', err)
+    }
+  }
+
+  const handleReactionAdded = (newReaction) => {
+    setReactions(prev => [newReaction, ...prev])
+  }
+
+  const handleReactionDeleted = (reactionId) => {
+    setReactions(prev => prev.filter(r => r.id !== reactionId))
+  }
+
   const handleToggleFavorite = async () => {
     try {
       const newFavorite = !fic.favorite
-      await fetch(`${API_URL}/fics/${id}`, {
+      await apiFetch(`${API_URL}/fics/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ favorite: newFavorite }),
@@ -77,7 +107,7 @@ export default function FicDetail() {
 
   const handleSaveNotes = async () => {
     try {
-      await fetch(`${API_URL}/fics/${id}`, {
+      await apiFetch(`${API_URL}/fics/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notes, personal_tags: personalTags }),
@@ -89,11 +119,82 @@ export default function FicDetail() {
     }
   }
 
+  const handleToggleEliteVault = async () => {
+    try {
+      if (fic.in_elite_vault) {
+        await apiFetch(`${API_URL}/fics/${id}/elite-vault`, { method: 'DELETE' })
+        setFic(prev => ({ ...prev, in_elite_vault: 0 }))
+        toast.success('Removed from Elite Vault')
+      } else {
+        const response = await apiFetch(`${API_URL}/fics/${id}/elite-vault`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ force: true }),
+        })
+        if (!response.ok) {
+          const data = await response.json()
+          throw new Error(data.error)
+        }
+        setFic(prev => ({ ...prev, in_elite_vault: 1 }))
+        toast.success('Added to Elite Vault! 🏆')
+      }
+    } catch (err) {
+      toast.error(err.message || 'Failed to update Elite Vault')
+    }
+  }
+
+  const handleDownload = async () => {
+    setDownloading(true)
+    const loadingToast = toast.loading('Fetching from AO3... this may take a moment')
+    try {
+      // Use AbortController with generous timeout for large fics
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 120000) // 2 min timeout
+
+      const response = await apiFetch(`${API_URL}/fics/${id}/content`, {
+        signal: controller.signal,
+      })
+      clearTimeout(timeout)
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || `Server error: ${response.status}`)
+      }
+
+      const data = await response.json()
+      await cacheFicContent(parseInt(id), data)
+      setCachedOffline(true)
+      toast.dismiss(loadingToast)
+      toast.success(`Saved! ${data.chapters?.length || 0} chapter(s) cached`)
+    } catch (err) {
+      toast.dismiss(loadingToast)
+      if (err.name === 'AbortError') {
+        toast.error('Request timed out — try again on faster WiFi')
+      } else if (err.message === 'Load failed' || err.message === 'Failed to fetch') {
+        toast.error('Can\'t reach server — make sure Mac backend is running')
+      } else {
+        toast.error(err.message || 'Download failed')
+      }
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  const handleRemoveDownload = async () => {
+    try {
+      await removeCachedContent(parseInt(id))
+      setCachedOffline(false)
+      toast.success('Offline copy removed')
+    } catch (err) {
+      toast.error('Failed to remove download')
+    }
+  }
+
   const handleDelete = async () => {
     if (!confirm('Remove this fic from your vault?')) return
 
     try {
-      await fetch(`${API_URL}/fics/${id}`, { method: 'DELETE' })
+      await apiFetch(`${API_URL}/fics/${id}`, { method: 'DELETE' })
       navigate('/')
     } catch (err) {
       console.error('Failed to delete fic:', err)
@@ -193,6 +294,56 @@ export default function FicDetail() {
               <ExternalLinkIcon />
               View on AO3
             </a>
+
+            <button
+              onClick={handleToggleEliteVault}
+              className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all ${
+                fic.in_elite_vault
+                  ? 'bg-gradient-to-r from-yellow-400/20 via-amber-500/20 to-yellow-600/20 text-amber-400 border border-amber-500/50'
+                  : 'vault-btn-secondary hover:text-amber-400 hover:border-amber-400/50'
+              }`}
+            >
+              <span>{fic.in_elite_vault ? '🏆' : '✨'}</span>
+              {fic.in_elite_vault ? 'In Elite Vault' : 'Elite Vault'}
+            </button>
+
+            {/* Download / Read Offline Button */}
+            {cachedOffline ? (
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => navigate(`/read/${id}`)}
+                  className="vault-btn-secondary flex items-center gap-2 text-accent-sage border-accent-sage/30"
+                >
+                  <BookOpenIcon className="w-4 h-4" />
+                  Read Offline
+                </button>
+                <button
+                  onClick={handleRemoveDownload}
+                  className="p-2 rounded-lg text-vault-muted hover:text-red-400 hover:bg-red-900/20 transition-colors"
+                  title="Remove offline copy"
+                >
+                  <TrashIcon />
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={handleDownload}
+                disabled={downloading}
+                className="vault-btn-secondary flex items-center gap-2 hover:text-accent-sage hover:border-accent-sage/50"
+              >
+                {downloading ? (
+                  <>
+                    <span className="w-4 h-4 border-2 border-vault-muted/30 border-t-accent-sage rounded-full animate-spin" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <DownloadIcon className="w-4 h-4" />
+                    Save Offline
+                  </>
+                )}
+              </button>
+            )}
 
             <div className="flex-1" />
 
@@ -312,76 +463,181 @@ export default function FicDetail() {
           </div>
         </div>
 
-        {/* Personal Notes Section */}
+        {/* Personal Notes & Tags */}
         <div className="vault-card">
-          <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center justify-between mb-3">
             <h2 className="text-lg font-semibold flex items-center gap-2">
               <EditIcon className="w-5 h-5" />
-              My Notes
+              Notes & Tags
             </h2>
             {!editingNotes && (
               <button
                 onClick={() => setEditingNotes(true)}
-                className="text-sm text-lj-blue-400 hover:underline"
+                className="text-sm text-accent-gold hover:underline"
               >
                 Edit
               </button>
             )}
           </div>
 
-          {editingNotes ? (
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm text-vault-muted mb-1">Personal Tags</label>
-                <input
-                  type="text"
-                  value={personalTags}
-                  onChange={(e) => setPersonalTags(e.target.value)}
-                  placeholder="comfort-fic, re-read, rec-from-friend..."
-                  className="vault-input"
-                />
-                <p className="text-xs text-vault-muted mt-1">Comma-separated tags for your own organization</p>
-              </div>
+          {/* Tags inline */}
+          <div className="flex flex-wrap gap-1.5 mb-3">
+            {myTags.map((tag, i) => (
+              <span key={i} className="text-xs bg-accent-gold/15 text-accent-gold px-2 py-0.5 rounded-full">
+                #{tag}
+              </span>
+            ))}
+            {myTags.length === 0 && !editingNotes && (
+              <span className="text-xs text-vault-muted italic">No tags yet — tap Edit to add</span>
+            )}
+          </div>
 
-              <div>
-                <label className="block text-sm text-vault-muted mb-1">Notes</label>
-                <textarea
-                  value={notes}
-                  onChange={(e) => setNotes(e.target.value)}
-                  placeholder="Your thoughts, where you left off, why you saved this..."
-                  className="vault-input min-h-[120px] resize-y"
-                />
-              </div>
+          {/* Notes display or empty */}
+          {!editingNotes && (
+            fic.notes ? (
+              <p className="text-vault-text text-sm whitespace-pre-wrap">{fic.notes}</p>
+            ) : (
+              <p className="text-vault-muted text-sm italic">No notes yet.</p>
+            )
+          )}
 
-              <div className="flex gap-3">
-                <button onClick={handleSaveNotes} className="vault-btn-primary">
-                  Save Notes
-                </button>
-                <button onClick={() => setEditingNotes(false)} className="vault-btn-secondary">
-                  Cancel
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div>
+          {/* Editing mode */}
+          {editingNotes && (
+            <div className="space-y-3 mt-2">
+              {/* Tag input */}
+              <input
+                type="text"
+                placeholder="Add tag + Enter (e.g. comfort-fic)"
+                className="vault-input text-sm w-full"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && e.target.value.trim()) {
+                    const newTag = e.target.value.trim().replace(/^#/, '')
+                    if (newTag && !myTags.includes(newTag)) {
+                      const updated = [...myTags, newTag]
+                      const newTagString = updated.join(', ')
+                      setPersonalTags(newTagString)
+                      apiFetch(`${API_URL}/fics/${id}`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ personal_tags: newTagString }),
+                      }).then(() => {
+                        setFic(prev => ({ ...prev, personal_tags: newTagString }))
+                        toast.success(`Added #${newTag}`)
+                      })
+                    }
+                    e.target.value = ''
+                  }
+                }}
+              />
+
+              {/* Removable tag pills */}
               {myTags.length > 0 && (
-                <div className="flex flex-wrap gap-2 mb-4">
+                <div className="flex flex-wrap gap-1.5">
                   {myTags.map((tag, i) => (
-                    <span key={i} className="inline-flex items-center gap-1 text-xs text-lj-blue-300 bg-lj-blue-900/30 px-2 py-1 rounded">
-                      <TagIcon className="w-3 h-3" />
-                      {tag}
+                    <span key={i} className="inline-flex items-center gap-1 text-xs bg-accent-gold/15 text-accent-gold px-2 py-0.5 rounded-full">
+                      #{tag}
+                      <button
+                        onClick={() => {
+                          const updated = myTags.filter((_, idx) => idx !== i)
+                          const newTagString = updated.join(', ')
+                          setPersonalTags(newTagString)
+                          apiFetch(`${API_URL}/fics/${id}`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ personal_tags: newTagString }),
+                          }).then(() => {
+                            setFic(prev => ({ ...prev, personal_tags: newTagString }))
+                            toast.success(`Removed #${tag}`)
+                          })
+                        }}
+                        className="hover:text-red-400"
+                      >×</button>
                     </span>
                   ))}
                 </div>
               )}
 
-              {fic.notes ? (
-                <p className="text-vault-text whitespace-pre-wrap">{fic.notes}</p>
-              ) : (
-                <p className="text-vault-muted italic">No notes yet. Click Edit to add your thoughts.</p>
-              )}
+              {/* Notes textarea */}
+              <textarea
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="Your thoughts, where you left off, favorite moments..."
+                className="vault-input min-h-[100px] resize-y text-sm w-full"
+                autoFocus
+              />
+              <div className="flex gap-2">
+                <button onClick={() => { handleSaveNotes(); toast.success('Saved!') }} className="vault-btn-primary text-sm">
+                  Save
+                </button>
+                <button onClick={() => { setNotes(fic.notes || ''); setEditingNotes(false) }} className="vault-btn-secondary text-sm">
+                  Cancel
+                </button>
+              </div>
             </div>
           )}
+        </div>
+
+        {/* Reactions Section */}
+        <div className="vault-card mt-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold flex items-center gap-2">
+              <span className="text-xl">✨</span>
+              Your Reactions
+            </h2>
+            <button
+              onClick={() => setShowReactionPicker(!showReactionPicker)}
+              className={`text-sm px-3 py-1.5 rounded-lg transition-all ${
+                showReactionPicker
+                  ? 'bg-vault-bg text-vault-muted'
+                  : 'bg-accent-gold/20 text-accent-gold hover:bg-accent-gold/30'
+              }`}
+            >
+              {showReactionPicker ? 'Close' : '+ Add Reaction'}
+            </button>
+          </div>
+
+          {showReactionPicker && (
+            <div className="mb-6 p-4 bg-vault-bg rounded-xl border border-vault-border">
+              <ReactionPicker
+                ficId={fic.id}
+                onReactionAdded={handleReactionAdded}
+              />
+            </div>
+          )}
+
+          <ReactionsDisplay
+            reactions={reactions}
+            onDelete={handleReactionDeleted}
+          />
+        </div>
+
+        {/* Notification Settings — WIPs only */}
+        {fic.status === 'WIP' && (
+          <div className="mt-6">
+            <NotificationSettings ficId={fic.id} ficStatus={fic.status} />
+          </div>
+        )}
+
+        {/* Read Count & Elite Vault Info */}
+        <div className="vault-card mt-6">
+          <div className="flex items-center gap-2 mb-3">
+            <span className="text-xl">📊</span>
+            <h3 className="text-lg font-semibold">Reading Stats</h3>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="text-center p-3 bg-vault-bg rounded-lg">
+              <div className="text-2xl font-bold text-vault-text">{fic.times_read || 0}</div>
+              <div className="text-xs text-vault-muted">Times Read</div>
+            </div>
+            <div className="text-center p-3 bg-vault-bg rounded-lg">
+              <div className="text-2xl font-bold text-vault-text">
+                {fic.in_elite_vault ? '🏆' : (fic.times_read || 0) >= 5 ? '✅' : `${5 - (fic.times_read || 0)} more`}
+              </div>
+              <div className="text-xs text-vault-muted">
+                {fic.in_elite_vault ? 'Elite Status' : (fic.times_read || 0) >= 5 ? 'Elite Eligible' : 'Until Elite'}
+              </div>
+            </div>
+          </div>
         </div>
       </main>
     </div>

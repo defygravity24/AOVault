@@ -5,8 +5,12 @@ node_modules/
 *.db
 *.db-journal
 
-# User storage (downloaded EPUBs)
+# User storage (downloaded EPUBs, files)
 backend/storage/
+backend/downloads/
+backend/build/
+backend/aovault.db.bak
+backend/package-lock 2.json
 
 # Logs
 *.log
