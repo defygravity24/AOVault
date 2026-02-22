@@ -579,26 +579,27 @@ async function parseAO3Work(url) {
       htmlData = response.data;
       console.log('AO3 fetch: direct succeeded');
     } catch (directErr) {
-      console.log('AO3 fetch: direct failed (' + directErr.message + '), trying proxy...');
+      console.log('AO3 fetch: direct failed (' + directErr.message + '), trying CF Worker proxy...');
 
-      // Strategy 2: Use allorigins.win /get endpoint (returns JSON with contents field)
+      // Strategy 2: Cloudflare Worker proxy (runs on CF edge network, bypasses AO3's CF blocking)
+      const workerUrl = process.env.AO3_PROXY_URL || 'https://ao3-proxy.defy-gravity-24-sda.workers.dev';
       try {
-        const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(cleanUrl)}`;
-        const proxyResponse = await getAxios().get(proxyUrl, { timeout: 25000 });
-        htmlData = proxyResponse.data.contents;
-        console.log('AO3 fetch: allorigins /get proxy succeeded');
-      } catch (proxy1Err) {
-        console.log('AO3 fetch: allorigins failed (' + proxy1Err.message + '), trying alt...');
+        const cfProxyUrl = `${workerUrl}/?url=${encodeURIComponent(cleanUrl)}`;
+        const cfResponse = await getAxios().get(cfProxyUrl, { timeout: 20000 });
+        htmlData = cfResponse.data;
+        console.log('AO3 fetch: Cloudflare Worker proxy succeeded');
+      } catch (cfErr) {
+        console.log('AO3 fetch: CF Worker failed (' + cfErr.message + '), trying with view_adult...');
 
-        // Strategy 3: Try with view_adult=true param
+        // Strategy 3: CF Worker with view_adult=true
         try {
-          const altUrl = cleanUrl + '?view_adult=true';
-          const proxy2Url = `https://api.allorigins.win/get?url=${encodeURIComponent(altUrl)}`;
-          const proxy2Response = await getAxios().get(proxy2Url, { timeout: 25000 });
-          htmlData = proxy2Response.data.contents;
-          console.log('AO3 fetch: allorigins alt succeeded');
-        } catch (proxy2Err) {
-          throw new Error(`525 - All fetch strategies failed`);
+          const adultUrl = cleanUrl + '?view_adult=true';
+          const cfProxyUrl2 = `${workerUrl}/?url=${encodeURIComponent(adultUrl)}`;
+          const cfResponse2 = await getAxios().get(cfProxyUrl2, { timeout: 20000 });
+          htmlData = cfResponse2.data;
+          console.log('AO3 fetch: CF Worker proxy (view_adult) succeeded');
+        } catch (cfErr2) {
+          throw new Error(`All fetch strategies failed (direct + CF Worker proxy)`);
         }
       }
     }
