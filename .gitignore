@@ -36,3 +36,6 @@ Thumbs.db
 
 # Lock files (generated from package.json)
 package-lock.json
+
+# Wrangler cache (contains account info)
+.wrangler/
