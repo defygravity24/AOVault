@@ -581,21 +581,22 @@ async function parseAO3Work(url) {
     } catch (directErr) {
       console.log('AO3 fetch: direct failed (' + directErr.message + '), trying proxy...');
 
-      // Strategy 2: Use allorigins.win proxy (reliable, free)
+      // Strategy 2: Use allorigins.win /get endpoint (returns JSON with contents field)
       try {
-        const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`;
-        const proxyResponse = await getAxios().get(proxyUrl, { timeout: 20000 });
-        htmlData = proxyResponse.data;
-        console.log('AO3 fetch: allorigins proxy succeeded');
+        const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(cleanUrl)}`;
+        const proxyResponse = await getAxios().get(proxyUrl, { timeout: 25000 });
+        htmlData = proxyResponse.data.contents;
+        console.log('AO3 fetch: allorigins /get proxy succeeded');
       } catch (proxy1Err) {
-        console.log('AO3 fetch: allorigins failed (' + proxy1Err.message + '), trying corsproxy...');
+        console.log('AO3 fetch: allorigins failed (' + proxy1Err.message + '), trying alt...');
 
-        // Strategy 3: Use corsproxy.io
+        // Strategy 3: Try with view_adult=true param
         try {
-          const proxy2Url = `https://corsproxy.io/?${encodeURIComponent(cleanUrl)}`;
-          const proxy2Response = await getAxios().get(proxy2Url, { timeout: 20000 });
-          htmlData = proxy2Response.data;
-          console.log('AO3 fetch: corsproxy succeeded');
+          const altUrl = cleanUrl + '?view_adult=true';
+          const proxy2Url = `https://api.allorigins.win/get?url=${encodeURIComponent(altUrl)}`;
+          const proxy2Response = await getAxios().get(proxy2Url, { timeout: 25000 });
+          htmlData = proxy2Response.data.contents;
+          console.log('AO3 fetch: allorigins alt succeeded');
         } catch (proxy2Err) {
           throw new Error(`525 - All fetch strategies failed`);
         }
