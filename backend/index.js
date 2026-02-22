@@ -560,20 +560,49 @@ async function parseAO3Work(url) {
     }
     const workId = match[1];
 
-    // Fetch the page (use browser-like headers to avoid Cloudflare blocks on cloud IPs)
-    const response = await getAxios().get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-      },
-      timeout: 15000,
-    });
+    // Clean URL to just the work page
+    const cleanUrl = `https://archiveofourown.org/works/${workId}`;
 
-    const root = getParseHTML()(response.data);
+    const browserHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1',
+    };
+
+    let htmlData;
+
+    // Strategy 1: Direct fetch
+    try {
+      const response = await getAxios().get(cleanUrl, { headers: browserHeaders, timeout: 15000 });
+      htmlData = response.data;
+      console.log('AO3 fetch: direct succeeded');
+    } catch (directErr) {
+      console.log('AO3 fetch: direct failed (' + directErr.message + '), trying proxy...');
+
+      // Strategy 2: Use allorigins.win proxy (reliable, free)
+      try {
+        const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`;
+        const proxyResponse = await getAxios().get(proxyUrl, { timeout: 20000 });
+        htmlData = proxyResponse.data;
+        console.log('AO3 fetch: allorigins proxy succeeded');
+      } catch (proxy1Err) {
+        console.log('AO3 fetch: allorigins failed (' + proxy1Err.message + '), trying corsproxy...');
+
+        // Strategy 3: Use corsproxy.io
+        try {
+          const proxy2Url = `https://corsproxy.io/?${encodeURIComponent(cleanUrl)}`;
+          const proxy2Response = await getAxios().get(proxy2Url, { timeout: 20000 });
+          htmlData = proxy2Response.data;
+          console.log('AO3 fetch: corsproxy succeeded');
+        } catch (proxy2Err) {
+          throw new Error(`525 - All fetch strategies failed`);
+        }
+      }
+    }
+
+    const root = getParseHTML()(htmlData);
 
     // Helper: get text content of all matching links inside a dd element
     const getLinksText = (selector) => {
