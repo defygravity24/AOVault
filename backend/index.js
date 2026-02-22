@@ -509,7 +509,9 @@ function parseAO3Html(url, htmlString) {
     return el.querySelectorAll('a').map(a => a.text.trim()).filter(Boolean);
   };
 
-  const title = (root.querySelector('h2.title')?.text || '').trim();
+  let title = (root.querySelector('h2.title')?.text || '').trim();
+  if (!title) title = (root.querySelector('.preface .title')?.text || '').trim();
+  if (!title) title = (root.querySelector('#workskin h2')?.text || '').trim();
   const authorEl = root.querySelector('a[rel="author"]');
   const author = authorEl ? authorEl.text.trim() : '';
   const authorUrl = authorEl ? authorEl.getAttribute('href') : null;
@@ -614,7 +616,22 @@ async function parseAO3Work(url) {
     };
 
     // Extract metadata
-    const title = (root.querySelector('h2.title')?.text || '').trim();
+    // AO3 uses <h2 class="title heading"> — try multiple selectors
+    let title = (root.querySelector('h2.title')?.text || '').trim();
+    if (!title) {
+      title = (root.querySelector('h2.title.heading')?.text || '').trim();
+    }
+    if (!title) {
+      // Fallback: look for the title in the work preface group
+      const prefaceTitle = root.querySelector('.preface .title');
+      title = prefaceTitle ? prefaceTitle.text.trim() : '';
+    }
+    if (!title) {
+      // Last resort: first h2 inside work meta
+      const anyH2 = root.querySelector('#workskin h2');
+      title = anyH2 ? anyH2.text.trim() : '';
+    }
+    console.log('AO3 parse: title found =', JSON.stringify(title));
     const authorEl = root.querySelector('a[rel="author"]');
     const author = authorEl ? authorEl.text.trim() : '';
     const authorUrl = authorEl ? authorEl.getAttribute('href') : null;
