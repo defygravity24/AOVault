@@ -63,14 +63,14 @@ export default function Library() {
       })
       let data = await response.json()
 
-      // If server can't reach AO3 (Cloudflare block), fetch from browser and relay HTML
+      // If server can't reach AO3 (Cloudflare block), use CF Worker proxy from browser
       if (response.status === 422 && data.needsClientFetch) {
         toast.dismiss(loadingToast)
-        const relayToast = toast.loading('Fetching from AO3 directly...')
+        const relayToast = toast.loading('Fetching from AO3 via proxy...')
         try {
-          const ao3Response = await fetch(url, {
-            headers: { 'Accept': 'text/html' },
-          })
+          const workerUrl = 'https://ao3-proxy.defy-gravity-24-sda.workers.dev'
+          const ao3Response = await fetch(`${workerUrl}/?url=${encodeURIComponent(url)}`)
+          if (!ao3Response.ok) throw new Error(`Proxy returned ${ao3Response.status}`)
           const html = await ao3Response.text()
           response = await apiFetch(`${API_URL}/fics/import`, {
             method: 'POST',
@@ -81,7 +81,7 @@ export default function Library() {
           toast.dismiss(relayToast)
         } catch (relayErr) {
           toast.dismiss(relayToast)
-          throw new Error('Could not reach AO3. Please check your connection.')
+          throw new Error('Could not reach AO3. Please try again in a minute.')
         }
       }
 
