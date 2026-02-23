@@ -11,7 +11,6 @@ console.log('[AOVault] Starting server...');
 
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -80,247 +79,239 @@ const ao3RateLimit = () => new Promise(resolve => {
   }
 });
 
-// Initialize SQLite database
-// In production on Render, use persistent disk mount if available
-const dataDir = process.env.DATA_DIR || __dirname;
-const dbPath = path.join(dataDir, 'aovault.db');
-const db = new Database(dbPath);
+// Database — uses better-sqlite3 locally, Turso/@libsql in production
+const db = require('./db');
 
-// Create tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE,
-    name TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS fics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER DEFAULT 1,
-    source TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    source_url TEXT NOT NULL,
-    title TEXT NOT NULL,
-    author TEXT,
-    author_url TEXT,
-    fandom TEXT,
-    ship TEXT,
-    rating TEXT,
-    warnings TEXT,
-    categories TEXT,
-    characters TEXT,
-    tags TEXT,
-    summary TEXT,
-    word_count INTEGER,
-    chapter_count INTEGER,
-    chapter_total INTEGER,
-    status TEXT,
-    language TEXT,
-    published_at TEXT,
-    updated_at TEXT,
-    epub_path TEXT,
-    notes TEXT,
-    personal_tags TEXT,
-    favorite INTEGER DEFAULT 0,
-    read_status TEXT DEFAULT 'unread',
-    read_progress INTEGER DEFAULT 0,
-    date_added DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, source, source_id)
-  );
-
-  CREATE TABLE IF NOT EXISTS reading_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    fic_id INTEGER,
-    user_id INTEGER DEFAULT 1,
-    chapter INTEGER,
-    progress_percent INTEGER,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (fic_id) REFERENCES fics(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS collections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER DEFAULT 1,
-    name TEXT NOT NULL,
-    description TEXT,
-    icon TEXT DEFAULT '📚',
-    is_smart BOOLEAN DEFAULT 0,
-    smart_rules TEXT,
-    position INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS collection_fics (
-    collection_id INTEGER NOT NULL,
-    fic_id INTEGER NOT NULL,
-    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (collection_id, fic_id),
-    FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
-    FOREIGN KEY (fic_id) REFERENCES fics(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS reaction_types (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    code TEXT UNIQUE NOT NULL,
-    emoji TEXT NOT NULL,
-    label TEXT NOT NULL,
-    position INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS fic_reactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    fic_id INTEGER NOT NULL,
-    reaction_code TEXT NOT NULL,
-    chapter_number INTEGER,
-    intensity INTEGER DEFAULT 3,
-    note TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (fic_id) REFERENCES fics(id) ON DELETE CASCADE
-  );
-`);
-
-console.log('Database initialized at:', dbPath);
-
-// Phase 4: Elite Vault & Notify When Complete — add columns if missing
-const ficColumns = db.prepare("PRAGMA table_info(fics)").all().map(c => c.name);
-if (!ficColumns.includes('in_elite_vault')) {
-  db.exec(`
-    ALTER TABLE fics ADD COLUMN in_elite_vault INTEGER DEFAULT 0;
+// =====================================
+// DATABASE INITIALIZATION (async for Turso compatibility)
+// =====================================
+async function initDatabase() {
+  // Create tables
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT UNIQUE,
+      name TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
   `);
-  console.log('Added in_elite_vault column');
-}
-if (!ficColumns.includes('notify_on_complete')) {
-  db.exec(`
-    ALTER TABLE fics ADD COLUMN notify_on_complete INTEGER DEFAULT 0;
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS fics (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER DEFAULT 1,
+      source TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      source_url TEXT NOT NULL,
+      title TEXT NOT NULL,
+      author TEXT,
+      author_url TEXT,
+      fandom TEXT,
+      ship TEXT,
+      rating TEXT,
+      warnings TEXT,
+      categories TEXT,
+      characters TEXT,
+      tags TEXT,
+      summary TEXT,
+      word_count INTEGER,
+      chapter_count INTEGER,
+      chapter_total INTEGER,
+      status TEXT,
+      language TEXT,
+      published_at TEXT,
+      updated_at TEXT,
+      epub_path TEXT,
+      notes TEXT,
+      personal_tags TEXT,
+      favorite INTEGER DEFAULT 0,
+      read_status TEXT DEFAULT 'unread',
+      read_progress INTEGER DEFAULT 0,
+      date_added DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, source, source_id)
+    );
   `);
-  console.log('Added notify_on_complete column');
-}
-if (!ficColumns.includes('binge_threshold')) {
-  db.exec(`
-    ALTER TABLE fics ADD COLUMN binge_threshold INTEGER DEFAULT 0;
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS reading_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fic_id INTEGER,
+      user_id INTEGER DEFAULT 1,
+      chapter INTEGER,
+      progress_percent INTEGER,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (fic_id) REFERENCES fics(id)
+    );
   `);
-  console.log('Added binge_threshold column');
-}
-if (!ficColumns.includes('times_read')) {
-  db.exec(`
-    ALTER TABLE fics ADD COLUMN times_read INTEGER DEFAULT 0;
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS collections (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER DEFAULT 1,
+      name TEXT NOT NULL,
+      description TEXT,
+      icon TEXT DEFAULT '📚',
+      is_smart BOOLEAN DEFAULT 0,
+      smart_rules TEXT,
+      position INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
   `);
-  console.log('Added times_read column');
-}
-if (!ficColumns.includes('last_checked_at')) {
-  db.exec(`
-    ALTER TABLE fics ADD COLUMN last_checked_at DATETIME;
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS collection_fics (
+      collection_id INTEGER NOT NULL,
+      fic_id INTEGER NOT NULL,
+      added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (collection_id, fic_id),
+      FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+      FOREIGN KEY (fic_id) REFERENCES fics(id) ON DELETE CASCADE
+    );
   `);
-  console.log('Added last_checked_at column');
-}
-if (!ficColumns.includes('elite_pin')) {
-  db.exec(`
-    ALTER TABLE fics ADD COLUMN elite_pin TEXT;
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS reaction_types (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT UNIQUE NOT NULL,
+      emoji TEXT NOT NULL,
+      label TEXT NOT NULL,
+      position INTEGER DEFAULT 0
+    );
   `);
-}
-// Offline download columns
-if (!ficColumns.includes('download_status')) {
-  db.exec(`ALTER TABLE fics ADD COLUMN download_status TEXT DEFAULT 'none';`);
-  console.log('Added download_status column');
-}
-if (!ficColumns.includes('download_format')) {
-  db.exec(`ALTER TABLE fics ADD COLUMN download_format TEXT;`);
-}
-if (!ficColumns.includes('download_path')) {
-  db.exec(`ALTER TABLE fics ADD COLUMN download_path TEXT;`);
-}
-if (!ficColumns.includes('downloaded_at')) {
-  db.exec(`ALTER TABLE fics ADD COLUMN downloaded_at DATETIME;`);
-}
-if (!ficColumns.includes('file_size')) {
-  db.exec(`ALTER TABLE fics ADD COLUMN file_size INTEGER;`);
-}
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS fic_reactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fic_id INTEGER NOT NULL,
+      reaction_code TEXT NOT NULL,
+      chapter_number INTEGER,
+      intensity INTEGER DEFAULT 3,
+      note TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (fic_id) REFERENCES fics(id) ON DELETE CASCADE
+    );
+  `);
 
-// Auth: add password_hash to users table
-const userColumns = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
-if (!userColumns.includes('password_hash')) {
-  db.exec(`ALTER TABLE users ADD COLUMN password_hash TEXT;`);
-  console.log('Added password_hash column to users');
-}
+  console.log('Database tables initialized');
 
-// Auth: add username column to users table
-if (!userColumns.includes('username')) {
-  db.exec(`ALTER TABLE users ADD COLUMN username TEXT;`);
-  console.log('Added username column to users');
-  // Backfill: set username from name (lowercased, no spaces) for existing users
-  const users = db.prepare('SELECT id, name FROM users WHERE username IS NULL').all();
-  const updateUsername = db.prepare('UPDATE users SET username = ? WHERE id = ?');
-  for (const u of users) {
-    if (u.name) {
-      const uname = u.name.toLowerCase().replace(/\s+/g, '');
-      updateUsername.run(uname, u.id);
-    }
+  // Phase 4: Elite Vault & Notify When Complete — add columns if missing
+  const ficColumnsRaw = await db.prepare("PRAGMA table_info(fics)").all();
+  const ficColumns = ficColumnsRaw.map(c => c.name);
+  if (!ficColumns.includes('in_elite_vault')) {
+    await db.exec(`ALTER TABLE fics ADD COLUMN in_elite_vault INTEGER DEFAULT 0;`);
+    console.log('Added in_elite_vault column');
   }
-  console.log(`Backfilled usernames for ${users.length} users`);
+  if (!ficColumns.includes('notify_on_complete')) {
+    await db.exec(`ALTER TABLE fics ADD COLUMN notify_on_complete INTEGER DEFAULT 0;`);
+    console.log('Added notify_on_complete column');
+  }
+  if (!ficColumns.includes('binge_threshold')) {
+    await db.exec(`ALTER TABLE fics ADD COLUMN binge_threshold INTEGER DEFAULT 0;`);
+    console.log('Added binge_threshold column');
+  }
+  if (!ficColumns.includes('times_read')) {
+    await db.exec(`ALTER TABLE fics ADD COLUMN times_read INTEGER DEFAULT 0;`);
+    console.log('Added times_read column');
+  }
+  if (!ficColumns.includes('last_checked_at')) {
+    await db.exec(`ALTER TABLE fics ADD COLUMN last_checked_at DATETIME;`);
+    console.log('Added last_checked_at column');
+  }
+  if (!ficColumns.includes('elite_pin')) {
+    await db.exec(`ALTER TABLE fics ADD COLUMN elite_pin TEXT;`);
+  }
+  // Offline download columns
+  if (!ficColumns.includes('download_status')) {
+    await db.exec(`ALTER TABLE fics ADD COLUMN download_status TEXT DEFAULT 'none';`);
+    console.log('Added download_status column');
+  }
+  if (!ficColumns.includes('download_format')) {
+    await db.exec(`ALTER TABLE fics ADD COLUMN download_format TEXT;`);
+  }
+  if (!ficColumns.includes('download_path')) {
+    await db.exec(`ALTER TABLE fics ADD COLUMN download_path TEXT;`);
+  }
+  if (!ficColumns.includes('downloaded_at')) {
+    await db.exec(`ALTER TABLE fics ADD COLUMN downloaded_at DATETIME;`);
+  }
+  if (!ficColumns.includes('file_size')) {
+    await db.exec(`ALTER TABLE fics ADD COLUMN file_size INTEGER;`);
+  }
+
+  // Auth: add password_hash to users table
+  const userColumnsRaw = await db.prepare("PRAGMA table_info(users)").all();
+  const userColumns = userColumnsRaw.map(c => c.name);
+  if (!userColumns.includes('password_hash')) {
+    await db.exec(`ALTER TABLE users ADD COLUMN password_hash TEXT;`);
+    console.log('Added password_hash column to users');
+  }
+
+  // Auth: add username column to users table
+  if (!userColumns.includes('username')) {
+    await db.exec(`ALTER TABLE users ADD COLUMN username TEXT;`);
+    console.log('Added username column to users');
+    // Backfill: set username from name (lowercased, no spaces) for existing users
+    const users = await db.prepare('SELECT id, name FROM users WHERE username IS NULL').all();
+    for (const u of users) {
+      if (u.name) {
+        const uname = u.name.toLowerCase().replace(/\s+/g, '');
+        await db.prepare('UPDATE users SET username = ? WHERE id = ?').run(uname, u.id);
+      }
+    }
+    console.log(`Backfilled usernames for ${users.length} users`);
+  }
+
+  // Elite Vault PIN storage (user-level)
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS user_settings (
+      user_id INTEGER PRIMARY KEY DEFAULT 1,
+      elite_pin TEXT,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  // Create default user if not exists
+  const defaultUser = await db.prepare('SELECT id FROM users WHERE id = 1').get();
+  if (!defaultUser) {
+    await db.prepare('INSERT INTO users (id, email, name) VALUES (1, ?, ?)').run('default@aovault.app', 'Default User');
+  }
+
+  // Seed default smart collections
+  const existingCollections = await db.prepare('SELECT COUNT(*) as count FROM collections WHERE user_id = 1').get();
+  if (existingCollections.count === 0) {
+    await db.prepare('INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (1, ?, ?, 1, ?, ?)').run('All Fics', '📖', '{"type":"all"}', 0);
+    await db.prepare('INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (1, ?, ?, 1, ?, ?)').run('Favorites', '❤️', '{"type":"favorites"}', 1);
+    await db.prepare('INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (1, ?, ?, 1, ?, ?)').run('Currently Reading', '📕', '{"type":"reading"}', 2);
+    await db.prepare('INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (1, ?, ?, 1, ?, ?)').run('WIPs', '🚧', '{"type":"wip"}', 3);
+    await db.prepare('INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (1, ?, ?, 1, ?, ?)').run('Complete', '✅', '{"type":"complete"}', 4);
+    console.log('Default smart collections created');
+  }
+
+  // Seed reaction types
+  const existingReactions = await db.prepare('SELECT COUNT(*) as count FROM reaction_types').get();
+  if (existingReactions.count === 0) {
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('smut', '🔥', 'SMUT', 1);
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('pwp', '🍆', 'PWP', 2);
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('destroyed', '😭', 'Destroyed Me', 3);
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('soft', '🥺', 'So Soft', 4);
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('feral', '🦝', 'Feral', 5);
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('dead', '💀', 'I Am Deceased', 6);
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('scream', '😱', 'SCREAMING', 7);
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('genius', '🧠', 'Literary Genius', 8);
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('horny', '🥵', 'Insanely Horny', 9);
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('thanks', '🙏', 'Giving Thanks', 10);
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('reread', '🔁', 'Will Reread', 11);
+    await db.prepare('INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run('comfort', '🧸', 'Comfort Fic', 12);
+    console.log('Default reaction types seeded');
+  }
+
+  // Add new reaction types if they don't exist yet (for existing databases)
+  const newReactions = [
+    ['horny', '🥵', 'Insanely Horny', 9],
+    ['thanks', '🙏', 'Giving Thanks', 10],
+    ['reread', '🔁', 'Will Reread', 11],
+    ['comfort', '🧸', 'Comfort Fic', 12],
+  ];
+  for (const r of newReactions) {
+    await db.prepare('INSERT OR IGNORE INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)').run(...r);
+  }
+
+  console.log('Database initialization complete');
 }
-
-// Elite Vault PIN storage (user-level)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS user_settings (
-    user_id INTEGER PRIMARY KEY DEFAULT 1,
-    elite_pin TEXT,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
-
-// Create default user if not exists
-const defaultUser = db.prepare('SELECT id FROM users WHERE id = 1').get();
-if (!defaultUser) {
-  db.prepare('INSERT INTO users (id, email, name) VALUES (1, ?, ?)').run('default@aovault.app', 'Default User');
-}
-
-// Seed default smart collections
-const existingCollections = db.prepare('SELECT COUNT(*) as count FROM collections WHERE user_id = 1').get();
-if (existingCollections.count === 0) {
-  const insertCollection = db.prepare(
-    'INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (1, ?, ?, 1, ?, ?)'
-  );
-  insertCollection.run('All Fics', '📖', '{"type":"all"}', 0);
-  insertCollection.run('Favorites', '❤️', '{"type":"favorites"}', 1);
-  insertCollection.run('Currently Reading', '📕', '{"type":"reading"}', 2);
-  insertCollection.run('WIPs', '🚧', '{"type":"wip"}', 3);
-  insertCollection.run('Complete', '✅', '{"type":"complete"}', 4);
-  console.log('Default smart collections created');
-}
-
-// Seed reaction types
-const existingReactions = db.prepare('SELECT COUNT(*) as count FROM reaction_types').get();
-if (existingReactions.count === 0) {
-  const insertReaction = db.prepare(
-    'INSERT INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)'
-  );
-  insertReaction.run('smut', '🔥', 'SMUT', 1);
-  insertReaction.run('pwp', '🍆', 'PWP', 2);
-  insertReaction.run('destroyed', '😭', 'Destroyed Me', 3);
-  insertReaction.run('soft', '🥺', 'So Soft', 4);
-  insertReaction.run('feral', '🦝', 'Feral', 5);
-  insertReaction.run('dead', '💀', 'I Am Deceased', 6);
-  insertReaction.run('scream', '😱', 'SCREAMING', 7);
-  insertReaction.run('genius', '🧠', 'Literary Genius', 8);
-  insertReaction.run('horny', '🥵', 'Insanely Horny', 9);
-  insertReaction.run('thanks', '🙏', 'Giving Thanks', 10);
-  insertReaction.run('reread', '🔁', 'Will Reread', 11);
-  insertReaction.run('comfort', '🧸', 'Comfort Fic', 12);
-  console.log('Default reaction types seeded');
-}
-
-// Add new reaction types if they don't exist yet (for existing databases)
-const newReactions = [
-  ['horny', '🥵', 'Insanely Horny', 9],
-  ['thanks', '🙏', 'Giving Thanks', 10],
-  ['reread', '🔁', 'Will Reread', 11],
-  ['comfort', '🧸', 'Comfort Fic', 12],
-];
-const insertIfNew = db.prepare(
-  'INSERT OR IGNORE INTO reaction_types (code, emoji, label, position) VALUES (?, ?, ?, ?)'
-);
-newReactions.forEach(r => insertIfNew.run(...r));
 
 // =====================================
 // AUTH MIDDLEWARE
@@ -365,14 +356,14 @@ app.post('/api/auth/signup', async (req, res) => {
     }
 
     // Check if username taken
-    const existingUsername = db.prepare('SELECT id FROM users WHERE LOWER(username) = ?').get(username.toLowerCase());
+    const existingUsername = await db.prepare('SELECT id FROM users WHERE LOWER(username) = ?').get(username.toLowerCase());
     if (existingUsername) {
       return res.status(409).json({ error: 'That username is taken' });
     }
 
     // Check if email taken (if provided)
     if (email) {
-      const existingEmail = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
+      const existingEmail = await db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
       if (existingEmail) {
         return res.status(409).json({ error: 'An account with this email already exists' });
       }
@@ -380,29 +371,26 @@ app.post('/api/auth/signup', async (req, res) => {
 
     // Hash password and create user
     const passwordHash = await bcrypt.hash(password, 10);
-    const result = db.prepare(
+    const result = await db.prepare(
       'INSERT INTO users (username, email, name, password_hash) VALUES (?, ?, ?, ?)'
     ).run(username.toLowerCase(), email ? email.toLowerCase() : null, name || username, passwordHash);
 
     const userId = result.lastInsertRowid;
 
     // Create default smart collections for this user
-    const insertCol = db.prepare(
-      'INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (?, ?, ?, 1, ?, ?)'
-    );
-    insertCol.run(userId, 'All Fics', '📖', '{"type":"all"}', 0);
-    insertCol.run(userId, 'Favorites', '❤️', '{"type":"favorites"}', 1);
-    insertCol.run(userId, 'Currently Reading', '📕', '{"type":"reading"}', 2);
-    insertCol.run(userId, 'WIPs', '🚧', '{"type":"wip"}', 3);
-    insertCol.run(userId, 'Complete', '✅', '{"type":"complete"}', 4);
+    await db.prepare('INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (?, ?, ?, 1, ?, ?)').run(userId, 'All Fics', '📖', '{"type":"all"}', 0);
+    await db.prepare('INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (?, ?, ?, 1, ?, ?)').run(userId, 'Favorites', '❤️', '{"type":"favorites"}', 1);
+    await db.prepare('INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (?, ?, ?, 1, ?, ?)').run(userId, 'Currently Reading', '📕', '{"type":"reading"}', 2);
+    await db.prepare('INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (?, ?, ?, 1, ?, ?)').run(userId, 'WIPs', '🚧', '{"type":"wip"}', 3);
+    await db.prepare('INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (?, ?, ?, 1, ?, ?)').run(userId, 'Complete', '✅', '{"type":"complete"}', 4);
 
     // Create user_settings row
-    db.prepare('INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)').run(userId);
+    await db.prepare('INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)').run(userId);
 
     // Generate JWT (30-day expiry)
     const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '30d' });
 
-    const user = db.prepare('SELECT id, username, email, name, created_at FROM users WHERE id = ?').get(userId);
+    const user = await db.prepare('SELECT id, username, email, name, created_at FROM users WHERE id = ?').get(userId);
     res.status(201).json({ token, user });
   } catch (error) {
     console.error('Signup error:', error);
@@ -420,9 +408,9 @@ app.post('/api/auth/login', async (req, res) => {
 
     // Try username first, then email
     const input = username.toLowerCase();
-    let user = db.prepare('SELECT * FROM users WHERE LOWER(username) = ?').get(input);
+    let user = await db.prepare('SELECT * FROM users WHERE LOWER(username) = ?').get(input);
     if (!user) {
-      user = db.prepare('SELECT * FROM users WHERE email = ?').get(input);
+      user = await db.prepare('SELECT * FROM users WHERE email = ?').get(input);
     }
 
     if (!user || !user.password_hash) {
@@ -447,11 +435,11 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // Get current user
-app.get('/api/auth/me', (req, res) => {
+app.get('/api/auth/me', async (req, res) => {
   if (req.userId === 1) {
     return res.json({ user: null, isGuest: true });
   }
-  const user = db.prepare('SELECT id, username, email, name, created_at FROM users WHERE id = ?').get(req.userId);
+  const user = await db.prepare('SELECT id, username, email, name, created_at FROM users WHERE id = ?').get(req.userId);
   if (!user) {
     return res.json({ user: null, isGuest: true });
   }
@@ -459,29 +447,26 @@ app.get('/api/auth/me', (req, res) => {
 });
 
 // Migrate guest data to authenticated user
-app.post('/api/auth/migrate', (req, res) => {
+app.post('/api/auth/migrate', async (req, res) => {
   if (req.userId === 1) {
     return res.status(400).json({ error: 'Must be logged in to migrate data' });
   }
 
-  const migrate = db.transaction(() => {
-    // Move guest fics to the new user
-    db.prepare('UPDATE fics SET user_id = ? WHERE user_id = 1').run(req.userId);
-    // Move guest collections (non-smart only — smart ones were already created for the user)
-    db.prepare('UPDATE collections SET user_id = ? WHERE user_id = 1 AND is_smart = 0').run(req.userId);
-    // Move reading history
-    db.prepare('UPDATE reading_history SET user_id = ? WHERE user_id = 1').run(req.userId);
-    // Copy user_settings (elite PIN)
-    const guestSettings = db.prepare('SELECT elite_pin FROM user_settings WHERE user_id = 1').get();
-    if (guestSettings?.elite_pin) {
-      db.prepare('UPDATE user_settings SET elite_pin = ? WHERE user_id = ?').run(guestSettings.elite_pin, req.userId);
-    }
-  });
-
   try {
-    migrate();
-    const ficCount = db.prepare('SELECT COUNT(*) as count FROM fics WHERE user_id = ?').get(req.userId).count;
-    res.json({ message: 'Guest data migrated to your account', ficsMigrated: ficCount });
+    // Move guest fics to the new user
+    await db.prepare('UPDATE fics SET user_id = ? WHERE user_id = 1').run(req.userId);
+    // Move guest collections (non-smart only — smart ones were already created for the user)
+    await db.prepare('UPDATE collections SET user_id = ? WHERE user_id = 1 AND is_smart = 0').run(req.userId);
+    // Move reading history
+    await db.prepare('UPDATE reading_history SET user_id = ? WHERE user_id = 1').run(req.userId);
+    // Copy user_settings (elite PIN)
+    const guestSettings = await db.prepare('SELECT elite_pin FROM user_settings WHERE user_id = 1').get();
+    if (guestSettings?.elite_pin) {
+      await db.prepare('UPDATE user_settings SET elite_pin = ? WHERE user_id = ?').run(guestSettings.elite_pin, req.userId);
+    }
+
+    const ficCountRow = await db.prepare('SELECT COUNT(*) as count FROM fics WHERE user_id = ?').get(req.userId);
+    res.json({ message: 'Guest data migrated to your account', ficsMigrated: ficCountRow.count });
   } catch (error) {
     console.error('Migration error:', error);
     res.status(500).json({ error: 'Failed to migrate data' });
@@ -783,7 +768,7 @@ app.post('/api/fics/import', async (req, res) => {
     }
 
     // Check if already saved
-    const existing = db.prepare(
+    const existing = await db.prepare(
       'SELECT id, title FROM fics WHERE user_id = ? AND source = ? AND source_id = ?'
     ).get(userId, ficData.source, ficData.source_id);
 
@@ -801,7 +786,7 @@ app.post('/api/fics/import', async (req, res) => {
     ficData.epub_path = epubPath;
 
     // Save to database
-    const insert = db.prepare(`
+    const result = await db.prepare(`
       INSERT INTO fics (
         user_id, source, source_id, source_url, title, author, author_url,
         fandom, ship, rating, warnings, categories, characters, tags,
@@ -810,9 +795,7 @@ app.post('/api/fics/import', async (req, res) => {
       ) VALUES (
         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
-    `);
-
-    const result = insert.run(
+    `).run(
       userId, ficData.source, ficData.source_id, ficData.source_url,
       ficData.title, ficData.author, ficData.author_url,
       ficData.fandom, ficData.ship, ficData.rating, ficData.warnings,
@@ -823,7 +806,7 @@ app.post('/api/fics/import', async (req, res) => {
     );
 
     // Return the saved fic
-    const savedFic = db.prepare('SELECT * FROM fics WHERE id = ?').get(result.lastInsertRowid);
+    const savedFic = await db.prepare('SELECT * FROM fics WHERE id = ?').get(result.lastInsertRowid);
 
     res.status(201).json({
       message: 'Fic saved to vault!',
@@ -836,7 +819,7 @@ app.post('/api/fics/import', async (req, res) => {
 });
 
 // Get all fics for user
-app.get('/api/fics', (req, res) => {
+app.get('/api/fics', async (req, res) => {
   const userId = req.userId;
   const { search, fandom, ship, status, rating, sort } = req.query;
 
@@ -892,14 +875,14 @@ app.get('/api/fics', (req, res) => {
       query += ' ORDER BY date_added DESC';
   }
 
-  const fics = db.prepare(query).all(...params);
+  const fics = await db.prepare(query).all(...params);
   res.json({ fics, count: fics.length });
 });
 
 // Get single fic
-app.get('/api/fics/:id', (req, res) => {
+app.get('/api/fics/:id', async (req, res) => {
   const { id } = req.params;
-  const fic = db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
+  const fic = await db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
 
   if (!fic) {
     return res.status(404).json({ error: 'Fic not found' });
@@ -909,7 +892,7 @@ app.get('/api/fics/:id', (req, res) => {
 });
 
 // Update fic (notes, personal tags, favorite, read status, elite vault, notifications)
-app.patch('/api/fics/:id', (req, res) => {
+app.patch('/api/fics/:id', async (req, res) => {
   const { id } = req.params;
   const { notes, personal_tags, favorite, read_status, read_progress,
           in_elite_vault, times_read, notify_on_complete, binge_threshold } = req.body;
@@ -961,16 +944,16 @@ app.patch('/api/fics/:id', (req, res) => {
   params.push(id);
   const query = `UPDATE fics SET ${updates.join(', ')} WHERE id = ?`;
 
-  db.prepare(query).run(...params);
-  const fic = db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
+  await db.prepare(query).run(...params);
+  const fic = await db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
 
   res.json({ message: 'Fic updated', fic });
 });
 
 // Delete fic
-app.delete('/api/fics/:id', (req, res) => {
+app.delete('/api/fics/:id', async (req, res) => {
   const { id } = req.params;
-  const fic = db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
+  const fic = await db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
 
   if (!fic) {
     return res.status(404).json({ error: 'Fic not found' });
@@ -982,23 +965,28 @@ app.delete('/api/fics/:id', (req, res) => {
   }
 
   // Delete from database
-  db.prepare('DELETE FROM fics WHERE id = ?').run(id);
+  await db.prepare('DELETE FROM fics WHERE id = ?').run(id);
 
   res.json({ message: 'Fic removed from vault' });
 });
 
 // Get stats
-app.get('/api/stats', (req, res) => {
+app.get('/api/stats', async (req, res) => {
   const userId = req.userId;
 
-  const totalFics = db.prepare('SELECT COUNT(*) as count FROM fics WHERE user_id = ?').get(userId).count;
-  const totalWords = db.prepare('SELECT SUM(word_count) as total FROM fics WHERE user_id = ?').get(userId).total || 0;
-  const favorites = db.prepare('SELECT COUNT(*) as count FROM fics WHERE user_id = ? AND favorite = 1').get(userId).count;
-  const complete = db.prepare("SELECT COUNT(*) as count FROM fics WHERE user_id = ? AND status = 'Complete'").get(userId).count;
-  const wip = db.prepare("SELECT COUNT(*) as count FROM fics WHERE user_id = ? AND status = 'WIP'").get(userId).count;
+  const totalFicsRow = await db.prepare('SELECT COUNT(*) as count FROM fics WHERE user_id = ?').get(userId);
+  const totalFics = totalFicsRow.count;
+  const totalWordsRow = await db.prepare('SELECT SUM(word_count) as total FROM fics WHERE user_id = ?').get(userId);
+  const totalWords = totalWordsRow.total || 0;
+  const favoritesRow = await db.prepare('SELECT COUNT(*) as count FROM fics WHERE user_id = ? AND favorite = 1').get(userId);
+  const favorites = favoritesRow.count;
+  const completeRow = await db.prepare("SELECT COUNT(*) as count FROM fics WHERE user_id = ? AND status = 'Complete'").get(userId);
+  const complete = completeRow.count;
+  const wipRow = await db.prepare("SELECT COUNT(*) as count FROM fics WHERE user_id = ? AND status = 'WIP'").get(userId);
+  const wip = wipRow.count;
 
   // Top fandoms
-  const topFandoms = db.prepare(`
+  const topFandoms = await db.prepare(`
     SELECT fandom, COUNT(*) as count
     FROM fics WHERE user_id = ? AND fandom != ''
     GROUP BY fandom
@@ -1007,7 +995,7 @@ app.get('/api/stats', (req, res) => {
   `).all(userId);
 
   // Top ships
-  const topShips = db.prepare(`
+  const topShips = await db.prepare(`
     SELECT ship, COUNT(*) as count
     FROM fics WHERE user_id = ? AND ship != ''
     GROUP BY ship
@@ -1027,9 +1015,9 @@ app.get('/api/stats', (req, res) => {
 });
 
 // Serve EPUB files for reading
-app.get('/api/fics/:id/epub', (req, res) => {
+app.get('/api/fics/:id/epub', async (req, res) => {
   const { id } = req.params;
-  const fic = db.prepare('SELECT epub_path FROM fics WHERE id = ?').get(id);
+  const fic = await db.prepare('SELECT epub_path FROM fics WHERE id = ?').get(id);
 
   if (!fic || !fic.epub_path) {
     return res.status(404).json({ error: 'EPUB not found' });
@@ -1049,10 +1037,10 @@ app.get('/api/fics/:id/epub', (req, res) => {
 // =====================================
 
 // Get all collections with fic counts
-app.get('/api/collections', (req, res) => {
+app.get('/api/collections', async (req, res) => {
   const userId = req.userId;
 
-  const collections = db.prepare(`
+  const collections = await db.prepare(`
     SELECT c.*,
       CASE
         WHEN c.is_smart = 1 THEN (
@@ -1076,7 +1064,7 @@ app.get('/api/collections', (req, res) => {
 });
 
 // Create a custom collection
-app.post('/api/collections', (req, res) => {
+app.post('/api/collections', async (req, res) => {
   const userId = req.userId;
   const { name, description, icon } = req.body;
 
@@ -1085,26 +1073,26 @@ app.post('/api/collections', (req, res) => {
   }
 
   // Get next position
-  const maxPos = db.prepare(
+  const maxPos = await db.prepare(
     'SELECT MAX(position) as maxPos FROM collections WHERE user_id = ?'
   ).get(userId);
   const position = (maxPos?.maxPos ?? -1) + 1;
 
-  const result = db.prepare(
+  const result = await db.prepare(
     'INSERT INTO collections (user_id, name, description, icon, is_smart, position) VALUES (?, ?, ?, ?, 0, ?)'
   ).run(userId, name, description || null, icon || '📚', position);
 
-  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(result.lastInsertRowid);
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(result.lastInsertRowid);
 
   res.status(201).json({ collection });
 });
 
 // Update a collection
-app.patch('/api/collections/:id', (req, res) => {
+app.patch('/api/collections/:id', async (req, res) => {
   const { id } = req.params;
   const { name, description, icon } = req.body;
 
-  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
   if (!collection) {
     return res.status(404).json({ error: 'Collection not found' });
   }
@@ -1123,16 +1111,16 @@ app.patch('/api/collections/:id', (req, res) => {
   }
 
   params.push(id);
-  db.prepare(`UPDATE collections SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-  const updated = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  await db.prepare(`UPDATE collections SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  const updated = await db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
   res.json({ collection: updated });
 });
 
 // Delete a custom collection
-app.delete('/api/collections/:id', (req, res) => {
+app.delete('/api/collections/:id', async (req, res) => {
   const { id } = req.params;
 
-  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
   if (!collection) {
     return res.status(404).json({ error: 'Collection not found' });
   }
@@ -1140,17 +1128,17 @@ app.delete('/api/collections/:id', (req, res) => {
     return res.status(400).json({ error: 'Cannot delete smart collections' });
   }
 
-  db.prepare('DELETE FROM collection_fics WHERE collection_id = ?').run(id);
-  db.prepare('DELETE FROM collections WHERE id = ?').run(id);
+  await db.prepare('DELETE FROM collection_fics WHERE collection_id = ?').run(id);
+  await db.prepare('DELETE FROM collections WHERE id = ?').run(id);
   res.json({ message: 'Collection deleted' });
 });
 
 // Get fics in a collection
-app.get('/api/collections/:id/fics', (req, res) => {
+app.get('/api/collections/:id/fics', async (req, res) => {
   const userId = req.userId;
   const { id } = req.params;
 
-  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
   if (!collection) {
     return res.status(404).json({ error: 'Collection not found' });
   }
@@ -1160,25 +1148,25 @@ app.get('/api/collections/:id/fics', (req, res) => {
     const rules = JSON.parse(collection.smart_rules || '{}');
     switch (rules.type) {
       case 'all':
-        fics = db.prepare('SELECT * FROM fics WHERE user_id = ? ORDER BY date_added DESC').all(userId);
+        fics = await db.prepare('SELECT * FROM fics WHERE user_id = ? ORDER BY date_added DESC').all(userId);
         break;
       case 'favorites':
-        fics = db.prepare('SELECT * FROM fics WHERE user_id = ? AND favorite = 1 ORDER BY date_added DESC').all(userId);
+        fics = await db.prepare('SELECT * FROM fics WHERE user_id = ? AND favorite = 1 ORDER BY date_added DESC').all(userId);
         break;
       case 'reading':
-        fics = db.prepare("SELECT * FROM fics WHERE user_id = ? AND read_status = 'reading' ORDER BY date_added DESC").all(userId);
+        fics = await db.prepare("SELECT * FROM fics WHERE user_id = ? AND read_status = 'reading' ORDER BY date_added DESC").all(userId);
         break;
       case 'wip':
-        fics = db.prepare("SELECT * FROM fics WHERE user_id = ? AND status = 'WIP' ORDER BY date_added DESC").all(userId);
+        fics = await db.prepare("SELECT * FROM fics WHERE user_id = ? AND status = 'WIP' ORDER BY date_added DESC").all(userId);
         break;
       case 'complete':
-        fics = db.prepare("SELECT * FROM fics WHERE user_id = ? AND status = 'Complete' ORDER BY date_added DESC").all(userId);
+        fics = await db.prepare("SELECT * FROM fics WHERE user_id = ? AND status = 'Complete' ORDER BY date_added DESC").all(userId);
         break;
       default:
         fics = [];
     }
   } else {
-    fics = db.prepare(`
+    fics = await db.prepare(`
       SELECT f.* FROM fics f
       JOIN collection_fics cf ON f.id = cf.fic_id
       WHERE cf.collection_id = ?
@@ -1190,10 +1178,10 @@ app.get('/api/collections/:id/fics', (req, res) => {
 });
 
 // Add fic to a collection
-app.post('/api/collections/:id/fics/:ficId', (req, res) => {
+app.post('/api/collections/:id/fics/:ficId', async (req, res) => {
   const { id, ficId } = req.params;
 
-  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
   if (!collection) {
     return res.status(404).json({ error: 'Collection not found' });
   }
@@ -1201,28 +1189,28 @@ app.post('/api/collections/:id/fics/:ficId', (req, res) => {
     return res.status(400).json({ error: 'Cannot manually add fics to smart collections' });
   }
 
-  const fic = db.prepare('SELECT * FROM fics WHERE id = ?').get(ficId);
+  const fic = await db.prepare('SELECT * FROM fics WHERE id = ?').get(ficId);
   if (!fic) {
     return res.status(404).json({ error: 'Fic not found' });
   }
 
   // Check if already in collection
-  const existing = db.prepare(
+  const existing = await db.prepare(
     'SELECT * FROM collection_fics WHERE collection_id = ? AND fic_id = ?'
   ).get(id, ficId);
   if (existing) {
     return res.status(409).json({ error: 'Fic already in this collection' });
   }
 
-  db.prepare('INSERT INTO collection_fics (collection_id, fic_id) VALUES (?, ?)').run(id, ficId);
+  await db.prepare('INSERT INTO collection_fics (collection_id, fic_id) VALUES (?, ?)').run(id, ficId);
   res.status(201).json({ message: 'Fic added to collection' });
 });
 
 // Remove fic from a collection
-app.delete('/api/collections/:id/fics/:ficId', (req, res) => {
+app.delete('/api/collections/:id/fics/:ficId', async (req, res) => {
   const { id, ficId } = req.params;
 
-  const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
   if (!collection) {
     return res.status(404).json({ error: 'Collection not found' });
   }
@@ -1230,7 +1218,7 @@ app.delete('/api/collections/:id/fics/:ficId', (req, res) => {
     return res.status(400).json({ error: 'Cannot manually remove fics from smart collections' });
   }
 
-  db.prepare('DELETE FROM collection_fics WHERE collection_id = ? AND fic_id = ?').run(id, ficId);
+  await db.prepare('DELETE FROM collection_fics WHERE collection_id = ? AND fic_id = ?').run(id, ficId);
   res.json({ message: 'Fic removed from collection' });
 });
 
@@ -1239,15 +1227,15 @@ app.delete('/api/collections/:id/fics/:ficId', (req, res) => {
 // =====================================
 
 // Get all reaction types
-app.get('/api/reactions/types', (req, res) => {
-  const types = db.prepare('SELECT * FROM reaction_types ORDER BY position').all();
+app.get('/api/reactions/types', async (req, res) => {
+  const types = await db.prepare('SELECT * FROM reaction_types ORDER BY position').all();
   res.json({ types });
 });
 
 // Get reactions for a fic
-app.get('/api/fics/:id/reactions', (req, res) => {
+app.get('/api/fics/:id/reactions', async (req, res) => {
   const { id } = req.params;
-  const reactions = db.prepare(`
+  const reactions = await db.prepare(`
     SELECT fr.*, rt.emoji, rt.label
     FROM fic_reactions fr
     JOIN reaction_types rt ON fr.reaction_code = rt.code
@@ -1258,7 +1246,7 @@ app.get('/api/fics/:id/reactions', (req, res) => {
 });
 
 // Add a reaction to a fic
-app.post('/api/fics/:id/reactions', (req, res) => {
+app.post('/api/fics/:id/reactions', async (req, res) => {
   const { id } = req.params;
   const { reaction_code, intensity = 3, chapter_number, note } = req.body;
 
@@ -1267,13 +1255,13 @@ app.post('/api/fics/:id/reactions', (req, res) => {
   }
 
   // Validate reaction type exists
-  const reactionType = db.prepare('SELECT * FROM reaction_types WHERE code = ?').get(reaction_code);
+  const reactionType = await db.prepare('SELECT * FROM reaction_types WHERE code = ?').get(reaction_code);
   if (!reactionType) {
     return res.status(400).json({ error: 'Invalid reaction code' });
   }
 
   // Validate fic exists
-  const fic = db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
+  const fic = await db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
   if (!fic) {
     return res.status(404).json({ error: 'Fic not found' });
   }
@@ -1281,12 +1269,12 @@ app.post('/api/fics/:id/reactions', (req, res) => {
   // Validate intensity
   const validIntensity = Math.max(1, Math.min(5, parseInt(intensity) || 3));
 
-  const result = db.prepare(`
+  const result = await db.prepare(`
     INSERT INTO fic_reactions (fic_id, reaction_code, intensity, chapter_number, note)
     VALUES (?, ?, ?, ?, ?)
   `).run(id, reaction_code, validIntensity, chapter_number || null, note || null);
 
-  const reaction = db.prepare(`
+  const reaction = await db.prepare(`
     SELECT fr.*, rt.emoji, rt.label
     FROM fic_reactions fr
     JOIN reaction_types rt ON fr.reaction_code = rt.code
@@ -1297,11 +1285,11 @@ app.post('/api/fics/:id/reactions', (req, res) => {
 });
 
 // Update a reaction
-app.patch('/api/reactions/:id', (req, res) => {
+app.patch('/api/reactions/:id', async (req, res) => {
   const { id } = req.params;
   const { intensity, note } = req.body;
 
-  const existing = db.prepare('SELECT * FROM fic_reactions WHERE id = ?').get(id);
+  const existing = await db.prepare('SELECT * FROM fic_reactions WHERE id = ?').get(id);
   if (!existing) {
     return res.status(404).json({ error: 'Reaction not found' });
   }
@@ -1323,9 +1311,9 @@ app.patch('/api/reactions/:id', (req, res) => {
   }
 
   values.push(id);
-  db.prepare(`UPDATE fic_reactions SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+  await db.prepare(`UPDATE fic_reactions SET ${updates.join(', ')} WHERE id = ?`).run(...values);
 
-  const reaction = db.prepare(`
+  const reaction = await db.prepare(`
     SELECT fr.*, rt.emoji, rt.label
     FROM fic_reactions fr
     JOIN reaction_types rt ON fr.reaction_code = rt.code
@@ -1336,15 +1324,15 @@ app.patch('/api/reactions/:id', (req, res) => {
 });
 
 // Delete a reaction
-app.delete('/api/reactions/:id', (req, res) => {
+app.delete('/api/reactions/:id', async (req, res) => {
   const { id } = req.params;
 
-  const existing = db.prepare('SELECT * FROM fic_reactions WHERE id = ?').get(id);
+  const existing = await db.prepare('SELECT * FROM fic_reactions WHERE id = ?').get(id);
   if (!existing) {
     return res.status(404).json({ error: 'Reaction not found' });
   }
 
-  db.prepare('DELETE FROM fic_reactions WHERE id = ?').run(id);
+  await db.prepare('DELETE FROM fic_reactions WHERE id = ?').run(id);
   res.json({ message: 'Reaction removed' });
 });
 
@@ -1353,32 +1341,32 @@ app.delete('/api/reactions/:id', (req, res) => {
 // =====================================
 
 // Get elite vault PIN status (has PIN been set?)
-app.get('/api/elite-vault/status', (req, res) => {
-  const settings = db.prepare('SELECT elite_pin FROM user_settings WHERE user_id = ?').get(req.userId);
+app.get('/api/elite-vault/status', async (req, res) => {
+  const settings = await db.prepare('SELECT elite_pin FROM user_settings WHERE user_id = ?').get(req.userId);
   res.json({ hasPin: !!(settings && settings.elite_pin) });
 });
 
 // Set or update elite vault PIN
-app.post('/api/elite-vault/pin', (req, res) => {
+app.post('/api/elite-vault/pin', async (req, res) => {
   const { pin } = req.body;
   if (!pin || pin.length < 4) {
     return res.status(400).json({ error: 'PIN must be at least 4 characters' });
   }
 
-  const existing = db.prepare('SELECT * FROM user_settings WHERE user_id = ?').get(req.userId);
+  const existing = await db.prepare('SELECT * FROM user_settings WHERE user_id = ?').get(req.userId);
   if (existing) {
-    db.prepare('UPDATE user_settings SET elite_pin = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?').run(pin, req.userId);
+    await db.prepare('UPDATE user_settings SET elite_pin = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?').run(pin, req.userId);
   } else {
-    db.prepare('INSERT INTO user_settings (user_id, elite_pin) VALUES (?, ?)').run(req.userId, pin);
+    await db.prepare('INSERT INTO user_settings (user_id, elite_pin) VALUES (?, ?)').run(req.userId, pin);
   }
 
   res.json({ message: 'PIN set successfully' });
 });
 
 // Verify elite vault PIN
-app.post('/api/elite-vault/verify', (req, res) => {
+app.post('/api/elite-vault/verify', async (req, res) => {
   const { pin } = req.body;
-  const settings = db.prepare('SELECT elite_pin FROM user_settings WHERE user_id = ?').get(req.userId);
+  const settings = await db.prepare('SELECT elite_pin FROM user_settings WHERE user_id = ?').get(req.userId);
 
   if (!settings || !settings.elite_pin) {
     return res.json({ valid: true, noPinSet: true });
@@ -1388,19 +1376,19 @@ app.post('/api/elite-vault/verify', (req, res) => {
 });
 
 // Get all elite vault fics
-app.get('/api/elite-vault', (req, res) => {
-  const fics = db.prepare(
+app.get('/api/elite-vault', async (req, res) => {
+  const fics = await db.prepare(
     'SELECT * FROM fics WHERE user_id = ? AND in_elite_vault = 1 ORDER BY date_added DESC'
   ).all(req.userId);
   res.json({ fics, count: fics.length });
 });
 
 // Add fic to elite vault
-app.post('/api/fics/:id/elite-vault', (req, res) => {
+app.post('/api/fics/:id/elite-vault', async (req, res) => {
   const { id } = req.params;
   const { force } = req.body;
 
-  const fic = db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
+  const fic = await db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
   if (!fic) {
     return res.status(404).json({ error: 'Fic not found' });
   }
@@ -1414,23 +1402,23 @@ app.post('/api/fics/:id/elite-vault', (req, res) => {
     });
   }
 
-  db.prepare('UPDATE fics SET in_elite_vault = 1 WHERE id = ?').run(id);
-  const updated = db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
+  await db.prepare('UPDATE fics SET in_elite_vault = 1 WHERE id = ?').run(id);
+  const updated = await db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
   res.json({ message: 'Added to Elite Vault', fic: updated });
 });
 
 // Remove from elite vault
-app.delete('/api/fics/:id/elite-vault', (req, res) => {
+app.delete('/api/fics/:id/elite-vault', async (req, res) => {
   const { id } = req.params;
-  db.prepare('UPDATE fics SET in_elite_vault = 0 WHERE id = ?').run(id);
+  await db.prepare('UPDATE fics SET in_elite_vault = 0 WHERE id = ?').run(id);
   res.json({ message: 'Removed from Elite Vault' });
 });
 
 // Increment times read
-app.post('/api/fics/:id/read-count', (req, res) => {
+app.post('/api/fics/:id/read-count', async (req, res) => {
   const { id } = req.params;
-  db.prepare('UPDATE fics SET times_read = COALESCE(times_read, 0) + 1 WHERE id = ?').run(id);
-  const fic = db.prepare('SELECT id, times_read, in_elite_vault FROM fics WHERE id = ?').get(id);
+  await db.prepare('UPDATE fics SET times_read = COALESCE(times_read, 0) + 1 WHERE id = ?').run(id);
+  const fic = await db.prepare('SELECT id, times_read, in_elite_vault FROM fics WHERE id = ?').get(id);
   res.json({
     times_read: fic.times_read,
     qualifies_for_elite: fic.times_read >= 5,
@@ -1443,9 +1431,9 @@ app.post('/api/fics/:id/read-count', (req, res) => {
 // =====================================
 
 // Get notification settings for a fic
-app.get('/api/fics/:id/notifications', (req, res) => {
+app.get('/api/fics/:id/notifications', async (req, res) => {
   const { id } = req.params;
-  const fic = db.prepare(
+  const fic = await db.prepare(
     'SELECT id, notify_on_complete, binge_threshold, status, chapter_count, chapter_total, last_checked_at FROM fics WHERE id = ?'
   ).get(id);
 
@@ -1464,7 +1452,7 @@ app.get('/api/fics/:id/notifications', (req, res) => {
 });
 
 // Update notification settings for a fic
-app.patch('/api/fics/:id/notifications', (req, res) => {
+app.patch('/api/fics/:id/notifications', async (req, res) => {
   const { id } = req.params;
   const { notify_on_complete, binge_threshold } = req.body;
 
@@ -1485,14 +1473,14 @@ app.patch('/api/fics/:id/notifications', (req, res) => {
   }
 
   params.push(id);
-  db.prepare(`UPDATE fics SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  await db.prepare(`UPDATE fics SET ${updates.join(', ')} WHERE id = ?`).run(...params);
 
   res.json({ message: 'Notification settings updated' });
 });
 
 // Check for fic updates (re-scrape AO3 for WIPs)
 app.post('/api/fics/check-updates', async (req, res) => {
-  const wips = db.prepare(
+  const wips = await db.prepare(
     "SELECT * FROM fics WHERE user_id = ? AND status = 'WIP' AND source = 'ao3'"
   ).all(req.userId);
 
@@ -1515,7 +1503,7 @@ app.post('/api/fics/check-updates', async (req, res) => {
 
       if (Object.keys(changes).length > 0) {
         // Update the fic in database
-        db.prepare(`
+        await db.prepare(`
           UPDATE fics SET
             chapter_count = ?, chapter_total = ?, word_count = ?,
             status = ?, updated_at = ?, last_checked_at = CURRENT_TIMESTAMP
@@ -1533,7 +1521,7 @@ app.post('/api/fics/check-updates', async (req, res) => {
           binge_ready: fic.binge_threshold > 0 && changes.new_chapters >= fic.binge_threshold,
         });
       } else {
-        db.prepare('UPDATE fics SET last_checked_at = CURRENT_TIMESTAMP WHERE id = ?').run(fic.id);
+        await db.prepare('UPDATE fics SET last_checked_at = CURRENT_TIMESTAMP WHERE id = ?').run(fic.id);
       }
     } catch (err) {
       results.push({ id: fic.id, title: fic.title, error: err.message });
@@ -1552,7 +1540,7 @@ app.get('/api/fics/:id/content', async (req, res) => {
   const { id } = req.params;
   const userId = req.userId;
 
-  const fic = db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
+  const fic = await db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
   if (!fic) {
     return res.status(404).json({ error: 'Fic not found' });
   }
@@ -1638,7 +1626,7 @@ app.post('/api/fics/:id/download', async (req, res) => {
     return res.status(400).json({ error: `Invalid format. Choose: ${validFormats.join(', ')}` });
   }
 
-  const fic = db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
+  const fic = await db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
   if (!fic) {
     return res.status(404).json({ error: 'Fic not found' });
   }
@@ -1648,7 +1636,7 @@ app.post('/api/fics/:id/download', async (req, res) => {
   }
 
   // Mark as downloading
-  db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('downloading', id);
+  await db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('downloading', id);
 
   try {
     // Rate limit AO3 requests
@@ -1668,12 +1656,12 @@ app.post('/api/fics/:id/download', async (req, res) => {
     });
 
     if (response.status === 429) {
-      db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('none', id);
+      await db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('none', id);
       return res.status(429).json({ error: 'AO3 rate limit hit. Please try again in a minute.' });
     }
 
     if (response.status !== 200) {
-      db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('failed', id);
+      await db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('failed', id);
       return res.status(502).json({ error: `AO3 returned status ${response.status}` });
     }
 
@@ -1689,7 +1677,7 @@ app.post('/api/fics/:id/download', async (req, res) => {
     const fileSize = response.data.length;
 
     // Update database
-    db.prepare(`
+    await db.prepare(`
       UPDATE fics SET
         download_status = 'downloaded',
         download_format = ?,
@@ -1699,27 +1687,27 @@ app.post('/api/fics/:id/download', async (req, res) => {
       WHERE id = ?
     `).run(format, filePath, fileSize, id);
 
-    const updated = db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
+    const updated = await db.prepare('SELECT * FROM fics WHERE id = ?').get(id);
     res.json({ message: 'Download complete', fic: updated });
   } catch (error) {
     console.error('Download error:', error.message);
-    db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('failed', id);
+    await db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('failed', id);
     res.status(500).json({ error: `Download failed: ${error.message}` });
   }
 });
 
 // Serve downloaded file for offline reading
-app.get('/api/fics/:id/download/file', (req, res) => {
+app.get('/api/fics/:id/download/file', async (req, res) => {
   const { id } = req.params;
   const userId = req.userId;
 
-  const fic = db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
+  const fic = await db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
   if (!fic || !fic.download_path) {
     return res.status(404).json({ error: 'No download found' });
   }
 
   if (!fs.existsSync(fic.download_path)) {
-    db.prepare("UPDATE fics SET download_status = 'none', download_path = NULL WHERE id = ?").run(id);
+    await db.prepare("UPDATE fics SET download_status = 'none', download_path = NULL WHERE id = ?").run(id);
     return res.status(404).json({ error: 'Download file missing' });
   }
 
@@ -1736,11 +1724,11 @@ app.get('/api/fics/:id/download/file', (req, res) => {
 });
 
 // Remove offline download
-app.delete('/api/fics/:id/download', (req, res) => {
+app.delete('/api/fics/:id/download', async (req, res) => {
   const { id } = req.params;
   const userId = req.userId;
 
-  const fic = db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
+  const fic = await db.prepare('SELECT * FROM fics WHERE id = ? AND user_id = ?').get(id, userId);
   if (!fic) {
     return res.status(404).json({ error: 'Fic not found' });
   }
@@ -1750,7 +1738,7 @@ app.delete('/api/fics/:id/download', (req, res) => {
     fs.unlinkSync(fic.download_path);
   }
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE fics SET
       download_status = 'none',
       download_format = NULL,
@@ -1764,9 +1752,9 @@ app.delete('/api/fics/:id/download', (req, res) => {
 });
 
 // List all downloaded fics
-app.get('/api/fics/downloaded', (req, res) => {
+app.get('/api/fics/downloaded', async (req, res) => {
   const userId = req.userId;
-  const fics = db.prepare(
+  const fics = await db.prepare(
     "SELECT * FROM fics WHERE user_id = ? AND download_status = 'downloaded' ORDER BY downloaded_at DESC"
   ).all(userId);
   res.json({ fics, count: fics.length });
@@ -1780,10 +1768,17 @@ if (isProduction) {
   });
 }
 
-// Start server
+// Start server — initialize database first, then listen
 const HOST = isProduction ? '0.0.0.0' : '0.0.0.0';
-app.listen(PORT, HOST, () => {
-  console.log(`AOVault API running on port ${PORT} (${isProduction ? 'production' : 'development'})`);
-});
+initDatabase()
+  .then(() => {
+    app.listen(PORT, HOST, () => {
+      console.log(`AOVault API running on port ${PORT} (${isProduction ? 'production' : 'development'})`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  });
 
 module.exports = app;
