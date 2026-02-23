@@ -7,9 +7,8 @@ const PROD_API = 'https://aovault.onrender.com/api'
 const getApiUrl = () => {
   // Capacitor native app (iOS/Android)
   if (window.Capacitor?.isNativePlatform()) {
-    // Real device can't use localhost — needs network IP or production URL
-    // Check if we have network connectivity to local backend
-    return NETWORK_API
+    // Production app uses the live server
+    return 'https://aovault.net/api'
   }
 
   // Running in a regular browser

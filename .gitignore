@@ -19,8 +19,13 @@ backend/package-lock 2.json
 frontend/dist/
 frontend/dist_v1_blue/
 
-# iOS native build (regenerated from source)
+# iOS native build (regenerated from source, except custom native code)
 frontend/ios/
+!frontend/ios/App/App/AppDelegate.swift
+!frontend/ios/App/App/Info.plist
+!frontend/ios/App/App/App.entitlements
+!frontend/ios/App/SaveToAOVault/
+!frontend/ios/App/SaveToAOVault/**
 
 # Environment
 .env
