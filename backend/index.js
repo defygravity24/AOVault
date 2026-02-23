@@ -375,7 +375,7 @@ app.post('/api/auth/signup', async (req, res) => {
       'INSERT INTO users (username, email, name, password_hash) VALUES (?, ?, ?, ?)'
     ).run(username.toLowerCase(), email ? email.toLowerCase() : null, name || username, passwordHash);
 
-    const userId = result.lastInsertRowid;
+    const userId = Number(Number(result.lastInsertRowid));
 
     // Create default smart collections for this user
     await db.prepare('INSERT INTO collections (user_id, name, icon, is_smart, smart_rules, position) VALUES (?, ?, ?, 1, ?, ?)').run(userId, 'All Fics', '📖', '{"type":"all"}', 0);
@@ -806,7 +806,7 @@ app.post('/api/fics/import', async (req, res) => {
     );
 
     // Return the saved fic
-    const savedFic = await db.prepare('SELECT * FROM fics WHERE id = ?').get(result.lastInsertRowid);
+    const savedFic = await db.prepare('SELECT * FROM fics WHERE id = ?').get(Number(result.lastInsertRowid));
 
     res.status(201).json({
       message: 'Fic saved to vault!',
@@ -1082,7 +1082,7 @@ app.post('/api/collections', async (req, res) => {
     'INSERT INTO collections (user_id, name, description, icon, is_smart, position) VALUES (?, ?, ?, ?, 0, ?)'
   ).run(userId, name, description || null, icon || '📚', position);
 
-  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(result.lastInsertRowid);
+  const collection = await db.prepare('SELECT * FROM collections WHERE id = ?').get(Number(result.lastInsertRowid));
 
   res.status(201).json({ collection });
 });
@@ -1279,7 +1279,7 @@ app.post('/api/fics/:id/reactions', async (req, res) => {
     FROM fic_reactions fr
     JOIN reaction_types rt ON fr.reaction_code = rt.code
     WHERE fr.id = ?
-  `).get(result.lastInsertRowid);
+  `).get(Number(result.lastInsertRowid));
 
   res.status(201).json({ reaction });
 });
