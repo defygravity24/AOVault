@@ -1760,6 +1760,42 @@ app.get('/api/fics/downloaded', async (req, res) => {
   res.json({ fics, count: fics.length });
 });
 
+// =====================================
+// MONITORING AGENTS
+// =====================================
+const monitor = require('./agents/monitor');
+
+// Get current status (cached — instant response)
+app.get('/api/monitor/status', (req, res) => {
+  const results = monitor.getLastResults();
+  if (!results) {
+    return res.json({ status: 'starting', message: 'Agents initializing — check back in 30 seconds' });
+  }
+  res.json(results);
+});
+
+// Get check history from database
+app.get('/api/monitor/history', async (req, res) => {
+  const { agent, hours = 24, limit = 200 } = req.query;
+  let query = `SELECT * FROM health_checks WHERE checked_at > datetime('now', '-${parseInt(hours)} hours')`;
+  const params = [];
+  if (agent) {
+    query += ' AND agent = ?';
+    params.push(agent);
+  }
+  query += ' ORDER BY checked_at DESC LIMIT ?';
+  params.push(parseInt(limit));
+
+  const checks = await db.prepare(query).all(...params);
+  res.json({ checks, count: checks.length });
+});
+
+// Trigger an immediate check (manual refresh)
+app.post('/api/monitor/check', async (req, res) => {
+  const results = await monitor.runAllAgents(db);
+  res.json(results);
+});
+
 // In production, serve frontend for any non-API route (SPA fallback)
 if (isProduction) {
   const frontendPath = path.join(__dirname, 'public');
@@ -1772,6 +1808,9 @@ if (isProduction) {
 const HOST = isProduction ? '0.0.0.0' : '0.0.0.0';
 initDatabase()
   .then(() => {
+    // Start monitoring agents after DB is ready
+    monitor.startMonitoring(db);
+
     app.listen(PORT, HOST, () => {
       console.log(`AOVault API running on port ${PORT} (${isProduction ? 'production' : 'development'})`);
     });

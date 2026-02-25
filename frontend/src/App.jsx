@@ -6,6 +6,7 @@ import Library from './pages/Library'
 import FicDetail from './pages/FicDetail'
 import Reader from './pages/Reader'
 import EliteVault from './pages/EliteVault'
+import Monitor from './pages/Monitor'
 import './App.css'
 
 function AppContent() {
@@ -26,9 +27,9 @@ function AppContent() {
   // Not logged in — show login screen, BUT allow /read/ routes through
   // so offline cached fics are always readable
   if (!user) {
-    // Check if we're on a reader URL — let it through for offline reading
-    const isReaderPath = window.location.pathname.startsWith('/read/')
-    if (!isReaderPath) {
+    // Check if we're on a reader or monitor URL — let them through without auth
+    const isPublicPath = window.location.pathname.startsWith('/read/') || window.location.pathname === '/monitor'
+    if (!isPublicPath) {
       return (
         <div className="min-h-screen bg-vault-bg flex flex-col items-center justify-center p-4">
           {/* Branding */}
@@ -79,6 +80,7 @@ function AppContent() {
         <Route path="/fic/:id" element={<FicDetail />} />
         <Route path="/read/:id" element={<Reader />} />
         <Route path="/elite-vault" element={<EliteVault />} />
+        <Route path="/monitor" element={<Monitor />} />
       </Routes>
     </BrowserRouter>
   )
