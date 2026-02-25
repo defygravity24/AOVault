@@ -22,13 +22,46 @@ export default function ImportModal({ isOpen, onClose, onImportSuccess }) {
     const loadingToast = toast.loading('Importing from AO3...')
 
     try {
-      const response = await apiFetch(`${API_URL}/fics/import`, {
+      let response = await apiFetch(`${API_URL}/fics/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url }),
       })
 
-      const data = await response.json()
+      let data = await response.json()
+
+      // Server can't reach AO3 — fetch via CF Worker proxy from client, then relay HTML
+      if (response.status === 422 && data.needsClientFetch) {
+        toast.dismiss(loadingToast)
+        const relayToast = toast.loading('Fetching from AO3 directly...')
+        try {
+          const workerUrl = 'https://ao3-proxy.defy-gravity-24-sda.workers.dev'
+          const ao3Response = await fetch(`${workerUrl}/?url=${encodeURIComponent(url)}`)
+          let html
+          if (!ao3Response.ok) {
+            // CF Worker also failed — try fetching AO3 directly from browser
+            const directResponse = await fetch(url, { mode: 'cors' }).catch(() => null)
+            if (directResponse?.ok) {
+              html = await directResponse.text()
+            } else {
+              throw new Error('AO3 is temporarily unavailable. Please try again in a minute.')
+            }
+          } else {
+            html = await ao3Response.text()
+          }
+          // Send the fetched HTML to our server for parsing
+          response = await apiFetch(`${API_URL}/fics/import`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url, html }),
+          })
+          data = await response.json()
+          toast.dismiss(relayToast)
+        } catch (relayErr) {
+          toast.dismiss(relayToast)
+          throw new Error(relayErr.message || 'Could not reach AO3. Please try again in a minute.')
+        }
+      }
 
       if (response.status === 409 && data.alreadySaved) {
         toast.dismiss(loadingToast)

@@ -751,14 +751,14 @@ app.post('/api/fics/import', async (req, res) => {
         try {
           ficData = await parseAO3Work(url);
         } catch (fetchErr) {
-          if (fetchErr.message.includes('525') || fetchErr.message.includes('403') || fetchErr.message.includes('503')) {
-            return res.status(422).json({
-              error: 'ao3_blocked',
-              message: 'Server cannot reach AO3. Please retry — the app will fetch it directly.',
-              needsClientFetch: true,
-            });
-          }
-          throw fetchErr;
+          // Any fetch failure → ask the client to relay the HTML instead
+          // This covers: 403, 429, 502, 503, 525, rate limits, CF blocks, timeouts, etc.
+          console.log(`Server-side AO3 fetch failed: ${fetchErr.message} — requesting client relay`);
+          return res.status(422).json({
+            error: 'ao3_blocked',
+            message: 'Server cannot reach AO3. Please retry — the app will fetch it directly.',
+            needsClientFetch: true,
+          });
         }
       }
     } else if (url.includes('fanfiction.net')) {
