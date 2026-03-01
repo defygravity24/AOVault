@@ -40,10 +40,6 @@ if (isProduction) {
 // Fallback: read from local .env file (development only)
 // NEVER generate a random one at runtime — that logs everyone out on each restart
 let JWT_SECRET = process.env.JWT_SECRET;
-const jwtKeys = Object.keys(process.env).filter(k => k.includes('JWT') || k.includes('SECRET') || k.includes('jwt') || k.includes('secret'));
-console.log(`[auth] JWT_SECRET from env: ${JWT_SECRET ? 'SET (' + JWT_SECRET.length + ' chars)' : 'NOT SET'}`);
-console.log(`[auth] Env keys matching JWT/SECRET: ${jwtKeys.length ? jwtKeys.join(', ') : 'NONE FOUND'}`);
-console.log(`[auth] All env key count: ${Object.keys(process.env).length}`);
 if (!JWT_SECRET) {
   const envPath = path.join(__dirname, '.env');
   if (fs.existsSync(envPath)) {
