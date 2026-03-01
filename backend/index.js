@@ -592,10 +592,7 @@ async function parseAO3Work(url) {
     // Attempt to fetch AO3 — with one server-side retry on rate limit
     const attemptFetch = async () => {
       const strategies = [
-        // Strategy 1: Direct fetch (fast when not blocked)
-        getAxios().get(cleanUrl, { headers: browserHeaders, timeout: 8000 })
-          .then(r => { console.log('AO3 fetch: direct succeeded'); return r.data; }),
-        // Strategy 2: CF Worker proxy (worker auto-adds view_adult=true)
+        // Strategy 1: CF Worker proxy (primary — Cloudflare edge IP, less likely rate-limited)
         getAxios().get(`${workerUrl}/?url=${encodeURIComponent(cleanUrl)}`, {
           timeout: 15000,
           validateStatus: (s) => s < 500, // Don't throw on 4xx so we can read rate limit body
@@ -616,6 +613,9 @@ async function parseAO3Work(url) {
             }
             throw new Error('CF Worker returned non-HTML');
           }),
+        // Strategy 2: Direct fetch (fallback — only if CF Worker fails)
+        getAxios().get(cleanUrl, { headers: browserHeaders, timeout: 8000 })
+          .then(r => { console.log('AO3 fetch: direct succeeded'); return r.data; }),
       ];
       return Promise.any(strategies);
     };
@@ -1924,8 +1924,7 @@ app.get('/api/fics/:id/content', async (req, res) => {
     let htmlData;
     try {
       htmlData = await Promise.any([
-        getAxios().get(fullUrl, { headers: browserHeaders, timeout: 15000 })
-          .then(r => { if (r.status === 429) throw new Error('rate_limited'); return r.data; }),
+        // Strategy 1: CF Worker (primary — Cloudflare edge IP)
         getAxios().get(`${workerUrl}/?url=${encodeURIComponent(fullUrl)}`, {
           timeout: 30000,
           validateStatus: (s) => s < 500,
@@ -1934,6 +1933,9 @@ app.get('/api/fics/:id/content', async (req, res) => {
           if (typeof r.data === 'string' && r.data.includes('<')) return r.data;
           throw new Error('CF Worker returned non-HTML');
         }),
+        // Strategy 2: Direct fetch (fallback)
+        getAxios().get(fullUrl, { headers: browserHeaders, timeout: 15000 })
+          .then(r => { if (r.status === 429) throw new Error('rate_limited'); return r.data; }),
       ]);
     } catch (fetchErr) {
       const isRateLimit = fetchErr.errors?.some(e => e.message === 'rate_limited')
