@@ -904,9 +904,9 @@ app.post('/api/fics/import', async (req, res) => {
     const ficId = Number(result.lastInsertRowid);
 
     // Parse EPUB and cache chapters in DB so they survive server restarts
-    if (epubPath && fs.existsSync(epubPath)) {
+    if (ficData.epub_path && fs.existsSync(ficData.epub_path)) {
       try {
-        const { chapters } = await parseEpubToChapters(epubPath);
+        const { chapters } = await parseEpubToChapters(ficData.epub_path);
         for (const ch of chapters) {
           await db.prepare(
             'INSERT OR IGNORE INTO fic_chapters (fic_id, chapter_number, title, html) VALUES (?, ?, ?, ?)'
@@ -921,7 +921,7 @@ app.post('/api/fics/import', async (req, res) => {
     res.status(201).json({
       message: 'Fic saved to vault!',
       fic: savedFic,
-      epubFailed: !epubPath,
+      epubFailed: !ficData.epub_path,
     });
   } catch (error) {
     console.error('Import Error:', error);
