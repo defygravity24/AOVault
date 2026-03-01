@@ -55,6 +55,8 @@ app.use(cors({
   origin: [
     'http://localhost:5173',
     'http://localhost:3001',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:3001',
     'http://192.168.1.215:5173',
     'http://192.168.1.215:3001',
     'https://aovault.net',
@@ -65,6 +67,10 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json());
+
+// Async route wrapper — catches unhandled errors so Express doesn't crash
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
 
 // AO3 rate limiter — minimum 1.5s between requests
 let lastAO3Request = 0;
@@ -231,6 +237,19 @@ async function initDatabase() {
   if (!ficColumns.includes('file_size')) {
     await db.exec(`ALTER TABLE fics ADD COLUMN file_size INTEGER;`);
   }
+
+  // Persistent chapter cache — survives server restarts (epub files do not)
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS fic_chapters (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fic_id INTEGER NOT NULL,
+      chapter_number INTEGER NOT NULL,
+      title TEXT,
+      html TEXT,
+      UNIQUE(fic_id, chapter_number),
+      FOREIGN KEY (fic_id) REFERENCES fics(id) ON DELETE CASCADE
+    );
+  `);
 
   // Auth: add password_hash to users table
   const userColumnsRaw = await db.prepare("PRAGMA table_info(users)").all();
@@ -547,8 +566,8 @@ async function parseAO3Work(url) {
     }
     const workId = match[1];
 
-    // Clean URL to just the work page
-    const cleanUrl = `https://archiveofourown.org/works/${workId}`;
+    // Always include view_adult=true to skip the interstitial page
+    const cleanUrl = `https://archiveofourown.org/works/${workId}?view_adult=true`;
 
     const browserHeaders = {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -560,34 +579,55 @@ async function parseAO3Work(url) {
 
     let htmlData;
 
-    // Strategy 1: Direct fetch
+    const workerUrl = process.env.AO3_PROXY_URL || 'https://ao3-proxy.defy-gravity-24-sda.workers.dev';
+
+    // Attempt to fetch AO3 — with one server-side retry on rate limit
+    const attemptFetch = async () => {
+      const strategies = [
+        // Strategy 1: Direct fetch (fast when not blocked)
+        getAxios().get(cleanUrl, { headers: browserHeaders, timeout: 8000 })
+          .then(r => { console.log('AO3 fetch: direct succeeded'); return r.data; }),
+        // Strategy 2: CF Worker proxy (worker auto-adds view_adult=true)
+        getAxios().get(`${workerUrl}/?url=${encodeURIComponent(cleanUrl)}`, {
+          timeout: 15000,
+          validateStatus: (s) => s < 500, // Don't throw on 4xx so we can read rate limit body
+        })
+          .then(r => {
+            // Rate limited — throw with retry info so server can wait and retry
+            if (r.status === 429 || (r.data && r.data.rateLimited)) {
+              const err = new Error('rate_limited');
+              err.retryAfter = r.data?.retryAfter || 30;
+              throw err;
+            }
+            if (r.status >= 400) {
+              throw new Error(`CF Worker returned ${r.status}`);
+            }
+            if (typeof r.data === 'string' && (r.data.includes('<!DOCTYPE') || r.data.includes('<html'))) {
+              console.log('AO3 fetch: CF Worker succeeded');
+              return r.data;
+            }
+            throw new Error('CF Worker returned non-HTML');
+          }),
+      ];
+      return Promise.any(strategies);
+    };
+
     try {
-      const response = await getAxios().get(cleanUrl, { headers: browserHeaders, timeout: 15000 });
-      htmlData = response.data;
-      console.log('AO3 fetch: direct succeeded');
-    } catch (directErr) {
-      console.log('AO3 fetch: direct failed (' + directErr.message + '), trying CF Worker proxy...');
-
-      // Strategy 2: Cloudflare Worker proxy (runs on CF edge network, bypasses AO3's CF blocking)
-      const workerUrl = process.env.AO3_PROXY_URL || 'https://ao3-proxy.defy-gravity-24-sda.workers.dev';
-      try {
-        const cfProxyUrl = `${workerUrl}/?url=${encodeURIComponent(cleanUrl)}`;
-        const cfResponse = await getAxios().get(cfProxyUrl, { timeout: 20000 });
-        htmlData = cfResponse.data;
-        console.log('AO3 fetch: Cloudflare Worker proxy succeeded');
-      } catch (cfErr) {
-        console.log('AO3 fetch: CF Worker failed (' + cfErr.message + '), trying with view_adult...');
-
-        // Strategy 3: CF Worker with view_adult=true
+      htmlData = await attemptFetch();
+    } catch (firstErr) {
+      // Check if the CF Worker got rate limited — wait and retry once
+      const rateLimitErr = firstErr.errors?.find(e => e.message === 'rate_limited');
+      const waitSec = rateLimitErr?.retryAfter;
+      if (waitSec && waitSec <= 45) {
+        console.log(`AO3 rate limited — server waiting ${waitSec}s then retrying...`);
+        await new Promise(r => setTimeout(r, waitSec * 1000));
         try {
-          const adultUrl = cleanUrl + '?view_adult=true';
-          const cfProxyUrl2 = `${workerUrl}/?url=${encodeURIComponent(adultUrl)}`;
-          const cfResponse2 = await getAxios().get(cfProxyUrl2, { timeout: 20000 });
-          htmlData = cfResponse2.data;
-          console.log('AO3 fetch: CF Worker proxy (view_adult) succeeded');
-        } catch (cfErr2) {
-          throw new Error(`All fetch strategies failed (direct + CF Worker proxy)`);
+          htmlData = await attemptFetch();
+        } catch {
+          throw new Error('All fetch strategies failed after rate limit retry');
         }
+      } else {
+        throw new Error('All fetch strategies failed (direct + CF Worker proxy)');
       }
     }
 
@@ -690,16 +730,35 @@ async function parseAO3Work(url) {
  * Download epub from AO3
  */
 async function downloadAO3Epub(workId, userId = 1) {
+  // Wait for AO3 rate limit to clear before downloading (metadata fetch just happened)
+  await ao3RateLimit();
+
   const epubUrl = `https://archiveofourown.org/downloads/${workId}/work.epub`;
+  const workerUrl = process.env.AO3_PROXY_URL || 'https://ao3-proxy.defy-gravity-24-sda.workers.dev';
+  const browserHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  };
 
   try {
-    const response = await getAxios().get(epubUrl, {
-      responseType: 'arraybuffer',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      },
-      timeout: 30000,
-    });
+    // Try direct first, fall back to CF Worker proxy (AO3 often 525s on direct)
+    let data;
+    try {
+      const response = await getAxios().get(epubUrl, {
+        responseType: 'arraybuffer',
+        headers: browserHeaders,
+        timeout: 15000,
+      });
+      data = response.data;
+      console.log('EPUB download: direct succeeded');
+    } catch (directErr) {
+      console.log(`EPUB direct failed (${directErr.message}), trying CF Worker...`);
+      const proxyResponse = await getAxios().get(
+        `${workerUrl}/?url=${encodeURIComponent(epubUrl)}`,
+        { responseType: 'arraybuffer', timeout: 30000 }
+      );
+      data = proxyResponse.data;
+      console.log('EPUB download: CF Worker succeeded');
+    }
 
     // Create storage directory
     const storageDir = path.join(__dirname, 'storage', String(userId));
@@ -709,7 +768,7 @@ async function downloadAO3Epub(workId, userId = 1) {
 
     // Save epub
     const epubPath = path.join(storageDir, `${workId}.epub`);
-    fs.writeFileSync(epubPath, response.data);
+    fs.writeFileSync(epubPath, data);
 
     return epubPath;
   } catch (error) {
@@ -807,10 +866,27 @@ app.post('/api/fics/import', async (req, res) => {
 
     // Return the saved fic
     const savedFic = await db.prepare('SELECT * FROM fics WHERE id = ?').get(Number(result.lastInsertRowid));
+    const ficId = Number(result.lastInsertRowid);
+
+    // Parse EPUB and cache chapters in DB so they survive server restarts
+    if (epubPath && fs.existsSync(epubPath)) {
+      try {
+        const { chapters } = await parseEpubToChapters(epubPath);
+        for (const ch of chapters) {
+          await db.prepare(
+            'INSERT OR IGNORE INTO fic_chapters (fic_id, chapter_number, title, html) VALUES (?, ?, ?, ?)'
+          ).run(ficId, ch.number, ch.title, ch.html);
+        }
+        console.log(`[import] Cached ${chapters.length} chapters for fic ${ficId} in DB`);
+      } catch (chErr) {
+        console.warn(`[import] Chapter cache failed (non-fatal): ${chErr.message}`);
+      }
+    }
 
     res.status(201).json({
       message: 'Fic saved to vault!',
       fic: savedFic,
+      epubFailed: !epubPath,
     });
   } catch (error) {
     console.error('Import Error:', error);
@@ -876,6 +952,15 @@ app.get('/api/fics', async (req, res) => {
   }
 
   const fics = await db.prepare(query).all(...params);
+  res.json({ fics, count: fics.length });
+});
+
+// Get downloaded fics (MUST be before /api/fics/:id to avoid route shadowing)
+app.get('/api/fics/downloaded', async (req, res) => {
+  const userId = req.userId;
+  const fics = await db.prepare(
+    "SELECT * FROM fics WHERE user_id = ? AND download_status = 'downloaded' ORDER BY downloaded_at DESC"
+  ).all(userId);
   res.json({ fics, count: fics.length });
 });
 
@@ -1479,15 +1564,26 @@ app.patch('/api/fics/:id/notifications', async (req, res) => {
 });
 
 // Check for fic updates (re-scrape AO3 for WIPs)
+// Rate limited: max 10 fics per check, with ao3RateLimit between each
 app.post('/api/fics/check-updates', async (req, res) => {
-  const wips = await db.prepare(
-    "SELECT * FROM fics WHERE user_id = ? AND status = 'WIP' AND source = 'ao3'"
+  const allWips = await db.prepare(
+    "SELECT * FROM fics WHERE user_id = ? AND status = 'WIP' AND source = 'ao3' ORDER BY last_checked_at ASC"
   ).all(req.userId);
 
+  // Check at most 10 per request, oldest-checked first
+  const wips = allWips.slice(0, 10);
   const results = [];
+  let consecutiveFailures = 0;
 
   for (const fic of wips) {
+    // Circuit breaker: stop if AO3 keeps failing
+    if (consecutiveFailures >= 2) {
+      results.push({ id: fic.id, title: fic.title, skipped: true, reason: 'AO3 rate limited' });
+      continue;
+    }
+
     try {
+      await ao3RateLimit();
       const updated = await parseAO3Work(fic.source_url);
 
       const changes = {};
@@ -1523,19 +1619,109 @@ app.post('/api/fics/check-updates', async (req, res) => {
       } else {
         await db.prepare('UPDATE fics SET last_checked_at = CURRENT_TIMESTAMP WHERE id = ?').run(fic.id);
       }
+      consecutiveFailures = 0; // Reset on success
     } catch (err) {
+      consecutiveFailures++;
       results.push({ id: fic.id, title: fic.title, error: err.message });
     }
   }
 
-  res.json({ checked: wips.length, updates: results });
+  res.json({
+    checked: wips.length,
+    total_wips: allWips.length,
+    remaining: Math.max(0, allWips.length - 10),
+    updates: results,
+  });
 });
 
 // =====================================
 // OFFLINE READING - FETCH FULL TEXT
 // =====================================
 
-// Fetch full fic content from AO3 for offline reading on device
+// Read all files from an epub (zip) into a {filename: string} map
+function readEpubFiles(epubPath) {
+  const yauzl = require('yauzl');
+  return new Promise((resolve, reject) => {
+    const files = {};
+    yauzl.open(epubPath, { lazyEntries: true }, (err, zip) => {
+      if (err) return reject(err);
+      zip.readEntry();
+      zip.on('entry', (entry) => {
+        if (/\/$/.test(entry.fileName)) { zip.readEntry(); return; } // skip directories
+        zip.openReadStream(entry, (err2, stream) => {
+          if (err2) { zip.readEntry(); return; }
+          const chunks = [];
+          stream.on('data', c => chunks.push(c));
+          stream.on('end', () => {
+            // Store as utf-8 text; binary files (images) will be garbled but we won't use them
+            files[entry.fileName] = Buffer.concat(chunks).toString('utf8');
+            zip.readEntry();
+          });
+          stream.on('error', () => zip.readEntry());
+        });
+      });
+      zip.on('end', () => resolve(files));
+      zip.on('error', reject);
+    });
+  });
+}
+
+// Parse an AO3 epub into chapter objects.
+// Fast path — epub already lives on disk from the import step, no AO3 request needed.
+async function parseEpubToChapters(epubPath) {
+  const files = await readEpubFiles(epubPath);
+
+  // Find OPF path via container.xml
+  const containerXml = files['META-INF/container.xml'];
+  if (!containerXml) throw new Error('Missing META-INF/container.xml');
+  const opfMatch = containerXml.match(/full-path="([^"]+\.opf)"/i);
+  if (!opfMatch) throw new Error('Cannot find OPF path in container.xml');
+  const opfPath = opfMatch[1];
+  const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+
+  const opfContent = files[opfPath];
+  if (!opfContent) throw new Error(`OPF file not found: ${opfPath}`);
+
+  // Build id → href map for manifest items
+  const idToHref = {};
+  for (const m of opfContent.matchAll(/id="([^"]+)"[^>]*href="([^"]+\.x?html?)"/gi)) {
+    idToHref[m[1]] = decodeURIComponent(m[2].split('?')[0]);
+  }
+
+  // Walk spine in order
+  const spineItems = [...opfContent.matchAll(/<itemref\s+idref="([^"]+)"/gi)];
+  const skipPaths = /(nav|cover|title|toc|copyright|acknowledgement)/i;
+  const chapters = [];
+
+  for (const m of spineItems) {
+    const href = idToHref[m[1]];
+    if (!href || skipPaths.test(href)) continue;
+
+    // AO3 epubs can be flat or in a subdirectory
+    const chapterHtml = files[opfDir + href] || files[href];
+    if (!chapterHtml) continue;
+
+    const bodyMatch = chapterHtml.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+    // Strip control characters (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F) that break JSON
+    const bodyContent = bodyMatch
+      ? bodyMatch[1].trim().replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+      : '';
+    if (!bodyContent) continue;
+
+    const titleMatch = bodyContent.match(/<h[123][^>]*class="[^"]*title[^"]*"[^>]*>([\s\S]*?)<\/h[123]>/i)
+      || bodyContent.match(/<h[123][^>]*>([\s\S]*?)<\/h[123]>/i);
+    const rawTitle = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : '';
+    const title = rawTitle || `Chapter ${chapters.length + 1}`;
+
+    chapters.push({ number: chapters.length + 1, title, html: bodyContent });
+  }
+
+  return { chapters };
+}
+
+// Fetch full fic content for offline reading on device.
+// Fast path: read from the epub already stored on this Mac.
+// Slow path: fetch full-work HTML from AO3 (only when epub missing).
 app.get('/api/fics/:id/content', async (req, res) => {
   const { id } = req.params;
   const userId = req.userId;
@@ -1549,42 +1735,109 @@ app.get('/api/fics/:id/content', async (req, res) => {
     return res.status(400).json({ error: 'Only AO3 fics supported for now' });
   }
 
+  // ── FASTEST PATH: chapters already cached in DB (survives server restarts) ──
+  const cachedChapters = await db.prepare(
+    'SELECT chapter_number, title, html FROM fic_chapters WHERE fic_id = ? ORDER BY chapter_number'
+  ).all(id);
+
+  if (cachedChapters.length > 0) {
+    console.log(`[content] Serving ${cachedChapters.length} chapters from DB for fic ${id}`);
+    return res.json({
+      id: fic.id,
+      title: fic.title,
+      author: fic.author,
+      chapters: cachedChapters.map(c => ({ number: c.chapter_number, title: c.title, html: c.html })),
+      preNote: null,
+      endNote: null,
+      fetchedAt: new Date().toISOString(),
+      source: 'db',
+    });
+  }
+
+  // ── FAST PATH: use the epub we already downloaded at import time ──
+  if (fic.epub_path && fs.existsSync(fic.epub_path)) {
+    try {
+      console.log(`[content] Using local epub for fic ${id}`);
+      const { chapters } = await parseEpubToChapters(fic.epub_path);
+      if (chapters.length > 0) {
+        // Also cache chapters in DB for future requests
+        try {
+          for (const ch of chapters) {
+            await db.prepare(
+              'INSERT OR IGNORE INTO fic_chapters (fic_id, chapter_number, title, html) VALUES (?, ?, ?, ?)'
+            ).run(id, ch.number, ch.title, ch.html);
+          }
+        } catch { /* non-fatal */ }
+        return res.json({
+          id: fic.id,
+          title: fic.title,
+          author: fic.author,
+          chapters,
+          preNote: null,
+          endNote: null,
+          fetchedAt: new Date().toISOString(),
+          source: 'epub',
+        });
+      }
+      console.log(`[content] Epub parsed but no chapters found — falling back to AO3 fetch`);
+    } catch (epubErr) {
+      console.warn(`[content] Epub parse failed (${epubErr.message}) — falling back to AO3 fetch`);
+    }
+  }
+
+  // ── SLOW PATH: fetch full-work HTML from AO3 ──
+  console.log(`[content] No usable epub for fic ${id} — fetching from AO3`);
   try {
     await ao3RateLimit();
 
-    // Fetch full work page (all chapters on one page)
     const fullUrl = `https://archiveofourown.org/works/${fic.source_id}?view_full_work=true&view_adult=true`;
-    const response = await getAxios().get(fullUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-      },
-      timeout: 60000,
-    });
+    const workerUrl = process.env.AO3_PROXY_URL || 'https://ao3-proxy.defy-gravity-24-sda.workers.dev';
+    const browserHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml',
+    };
 
-    if (response.status === 429) {
-      return res.status(429).json({ error: 'AO3 rate limit. Try again in a minute.' });
+    let htmlData;
+    try {
+      htmlData = await Promise.any([
+        getAxios().get(fullUrl, { headers: browserHeaders, timeout: 15000 })
+          .then(r => { if (r.status === 429) throw new Error('rate_limited'); return r.data; }),
+        getAxios().get(`${workerUrl}/?url=${encodeURIComponent(fullUrl)}`, {
+          timeout: 30000,
+          validateStatus: (s) => s < 500,
+        }).then(r => {
+          if (r.status === 429 || r.data?.rateLimited) throw new Error('rate_limited');
+          if (typeof r.data === 'string' && r.data.includes('<')) return r.data;
+          throw new Error('CF Worker returned non-HTML');
+        }),
+      ]);
+    } catch (fetchErr) {
+      const isRateLimit = fetchErr.errors?.some(e => e.message === 'rate_limited')
+        || fetchErr.message === 'rate_limited';
+      if (isRateLimit) {
+        return res.status(429).json({ error: 'AO3 rate limit hit. Please try again in a minute.' });
+      }
+      return res.status(502).json({ error: 'Could not reach AO3. Try again in a minute.' });
     }
 
-    const root = getParseHTML()(response.data);
+    if (!htmlData || typeof htmlData !== 'string') {
+      return res.status(502).json({ error: 'AO3 returned empty response' });
+    }
 
-    // Extract chapter content
+    const root = getParseHTML()(htmlData);
     const chapters = [];
     const chapterDivs = root.querySelectorAll('div#chapters > div.chapter') || [];
 
     if (chapterDivs.length > 0) {
-      // Multi-chapter fic — only grab top-level chapter divs
       chapterDivs.forEach((div) => {
         const userstuff = div.querySelector('div.userstuff[role="article"]') || div.querySelector('div.userstuff');
         const html = userstuff ? userstuff.innerHTML.trim() : '';
-        // Skip empty chapter divs (AO3 has preface/group wrappers)
         if (!html) return;
         const titleEl = div.querySelector('h3.title a') || div.querySelector('h3.title');
         const title = titleEl ? titleEl.text.trim() : `Chapter ${chapters.length + 1}`;
         chapters.push({ number: chapters.length + 1, title, html });
       });
     } else {
-      // Single-chapter fic
       const userstuff = root.querySelector('div.userstuff[role="article"]') ||
                         root.querySelector('div#chapters div.userstuff') ||
                         root.querySelector('div.userstuff');
@@ -1592,11 +1845,20 @@ app.get('/api/fics/:id/content', async (req, res) => {
       chapters.push({ number: 1, title: fic.title, html });
     }
 
-    // Extract author notes if present
     const preNote = root.querySelector('div.preface div.notes div.userstuff');
     const endNote = root.querySelector('div.end.notes div.userstuff');
 
-    res.json({
+    // Cache chapters in DB so the NEXT request is instant (doesn't need AO3 again)
+    try {
+      for (const ch of chapters) {
+        await db.prepare(
+          'INSERT OR IGNORE INTO fic_chapters (fic_id, chapter_number, title, html) VALUES (?, ?, ?, ?)'
+        ).run(id, ch.number, ch.title, ch.html);
+      }
+      console.log(`[content] Cached ${chapters.length} AO3 chapters in DB for fic ${id}`);
+    } catch { /* non-fatal */ }
+
+    return res.json({
       id: fic.id,
       title: fic.title,
       author: fic.author,
@@ -1604,6 +1866,7 @@ app.get('/api/fics/:id/content', async (req, res) => {
       preNote: preNote ? preNote.innerHTML.trim() : null,
       endNote: endNote ? endNote.innerHTML.trim() : null,
       fetchedAt: new Date().toISOString(),
+      source: 'ao3',
     });
   } catch (error) {
     console.error('Content fetch error:', error.message);
@@ -1645,17 +1908,29 @@ app.post('/api/fics/:id/download', async (req, res) => {
     // Use AO3's official download URL
     const slug = fic.title.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 50);
     const downloadUrl = `https://archiveofourown.org/downloads/${fic.source_id}/${slug}.${format}`;
+    const workerUrl = process.env.AO3_PROXY_URL || 'https://ao3-proxy.defy-gravity-24-sda.workers.dev';
+    const browserHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    };
 
-    const response = await getAxios().get(downloadUrl, {
-      responseType: 'arraybuffer',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      },
-      timeout: 60000,
-      validateStatus: (status) => status < 500,
-    });
+    // Try direct, fall back to CF Worker proxy (AO3 often 525s on direct)
+    let response;
+    try {
+      response = await getAxios().get(downloadUrl, {
+        responseType: 'arraybuffer', headers: browserHeaders, timeout: 15000,
+        validateStatus: (s) => s < 500,
+      });
+      if (response.status === 429) throw new Error('429');
+      if (response.status !== 200) throw new Error(`${response.status}`);
+    } catch {
+      console.log('Download direct failed, trying CF Worker...');
+      response = await getAxios().get(
+        `${workerUrl}/?url=${encodeURIComponent(downloadUrl)}`,
+        { responseType: 'arraybuffer', timeout: 30000, validateStatus: (s) => s < 500 }
+      );
+    }
 
-    if (response.status === 429) {
+    if (response.status === 429 || (response.data?.rateLimited)) {
       await db.prepare('UPDATE fics SET download_status = ? WHERE id = ?').run('none', id);
       return res.status(429).json({ error: 'AO3 rate limit hit. Please try again in a minute.' });
     }
@@ -1752,14 +2027,6 @@ app.delete('/api/fics/:id/download', async (req, res) => {
 });
 
 // List all downloaded fics
-app.get('/api/fics/downloaded', async (req, res) => {
-  const userId = req.userId;
-  const fics = await db.prepare(
-    "SELECT * FROM fics WHERE user_id = ? AND download_status = 'downloaded' ORDER BY downloaded_at DESC"
-  ).all(userId);
-  res.json({ fics, count: fics.length });
-});
-
 // =====================================
 // MONITORING AGENTS
 // =====================================
@@ -1803,6 +2070,15 @@ if (isProduction) {
     res.sendFile(path.join(frontendPath, 'index.html'));
   });
 }
+
+// Global error handler — catches any unhandled errors from async routes
+// Must be defined AFTER all routes
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err.message);
+  if (!res.headersSent) {
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
 
 // Start server — initialize database first, then listen
 const HOST = isProduction ? '0.0.0.0' : '0.0.0.0';
