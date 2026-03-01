@@ -40,6 +40,7 @@ if (isProduction) {
 // Fallback: read from local .env file (development only)
 // NEVER generate a random one at runtime — that logs everyone out on each restart
 let JWT_SECRET = process.env.JWT_SECRET;
+console.log(`[auth] JWT_SECRET from env: ${JWT_SECRET ? 'SET (' + JWT_SECRET.length + ' chars)' : 'NOT SET'}`);
 if (!JWT_SECRET) {
   const envPath = path.join(__dirname, '.env');
   if (fs.existsSync(envPath)) {
