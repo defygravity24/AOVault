@@ -925,6 +925,94 @@ app.post('/api/fics/import', async (req, res) => {
   }
 });
 
+// Import a fic from a client-supplied EPUB (base64 encoded).
+// Used when both the server and CF Worker HTML proxy are blocked by AO3 —
+// the client downloads the EPUB directly from the CF Worker and sends it here.
+app.post('/api/fics/import-epub', express.json({ limit: '30mb' }), async (req, res) => {
+  try {
+    const { url, epubBase64 } = req.body;
+    const userId = req.userId;
+
+    if (!url || !epubBase64) {
+      return res.status(400).json({ error: 'url and epubBase64 are required' });
+    }
+
+    const ao3Regex = /archiveofourown\.org\/works\/(\d+)/;
+    const match = url.match(ao3Regex);
+    if (!match) return res.status(400).json({ error: 'Invalid AO3 URL' });
+    const workId = match[1];
+
+    // Decode and save EPUB to disk
+    const epubBuffer = Buffer.from(epubBase64, 'base64');
+    const storageDir = path.join(__dirname, 'storage', String(userId));
+    if (!fs.existsSync(storageDir)) fs.mkdirSync(storageDir, { recursive: true });
+    const epubPath = path.join(storageDir, `${workId}.epub`);
+    fs.writeFileSync(epubPath, epubBuffer);
+    console.log(`[import-epub] Saved ${epubBuffer.length} bytes for work ${workId}`);
+
+    // Parse metadata from preface.xhtml inside the EPUB
+    const epubFiles = await readEpubFiles(epubPath);
+    const prefaceKey = Object.keys(epubFiles).find(k => /preface/i.test(k));
+    if (!prefaceKey) {
+      return res.status(422).json({ error: 'No preface found in EPUB — cannot extract metadata' });
+    }
+    const ficData = parseAO3Html(url, epubFiles[prefaceKey]);
+    ficData.epub_path = epubPath;
+
+    // Check if already saved
+    const existing = await db.prepare(
+      'SELECT id, title FROM fics WHERE user_id = ? AND source = ? AND source_id = ?'
+    ).get(userId, ficData.source, ficData.source_id);
+    if (existing) {
+      return res.status(409).json({
+        error: 'This fic is already in your vault',
+        ficId: existing.id,
+        title: existing.title,
+        alreadySaved: true,
+      });
+    }
+
+    // Save to database
+    const result = await db.prepare(`
+      INSERT INTO fics (
+        user_id, source, source_id, source_url, title, author, author_url,
+        fandom, ship, rating, warnings, categories, characters, tags,
+        summary, word_count, chapter_count, chapter_total, status,
+        language, published_at, updated_at, epub_path
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      userId, ficData.source, ficData.source_id, ficData.source_url,
+      ficData.title, ficData.author, ficData.author_url,
+      ficData.fandom, ficData.ship, ficData.rating, ficData.warnings,
+      ficData.categories, ficData.characters, ficData.tags,
+      ficData.summary, ficData.word_count, ficData.chapter_count,
+      ficData.chapter_total, ficData.status, ficData.language,
+      ficData.published_at, ficData.updated_at, ficData.epub_path
+    );
+
+    const ficId = Number(result.lastInsertRowid);
+    const savedFic = await db.prepare('SELECT * FROM fics WHERE id = ?').get(ficId);
+
+    // Parse EPUB chapters and cache in DB
+    try {
+      const { chapters } = await parseEpubToChapters(epubPath);
+      for (const ch of chapters) {
+        await db.prepare(
+          'INSERT OR IGNORE INTO fic_chapters (fic_id, chapter_number, title, html) VALUES (?, ?, ?, ?)'
+        ).run(ficId, ch.number, ch.title, ch.html);
+      }
+      console.log(`[import-epub] Cached ${chapters.length} chapters for fic ${ficId}`);
+    } catch (chErr) {
+      console.warn(`[import-epub] Chapter cache failed (non-fatal): ${chErr.message}`);
+    }
+
+    res.status(201).json({ message: 'Fic saved to vault!', fic: savedFic, epubFailed: false });
+  } catch (error) {
+    console.error('Import-EPUB Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get all fics for user
 app.get('/api/fics', async (req, res) => {
   const userId = req.userId;

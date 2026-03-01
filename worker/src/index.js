@@ -1,12 +1,11 @@
 /**
  * AO3 Proxy Worker
  *
- * Runs on Cloudflare's edge network to fetch AO3 pages.
- * Since AO3 uses Cloudflare for protection, requests from within
- * Cloudflare's network aren't blocked by IP-based restrictions.
+ * Runs on Cloudflare's edge network to fetch AO3 pages and EPUBs.
  *
- * Usage: GET /?url=https://archiveofourown.org/works/12345
- * Returns: The HTML content of the AO3 page
+ * Usage:
+ *   GET /?url=https://archiveofourown.org/works/12345         → HTML page (text/html)
+ *   GET /?url=https://archiveofourown.org/downloads/12345/... → EPUB download (base64 JSON)
  */
 
 export default {
@@ -36,73 +35,92 @@ export default {
       return jsonResponse({ error: 'Only archiveofourown.org URLs are allowed' }, 403, request, env);
     }
 
+    const isEpubDownload = targetUrl.includes('/downloads/');
+
     const fetchHeaders = {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept': isEpubDownload
+        ? 'application/epub+zip,application/octet-stream,*/*'
+        : 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.5',
       'Accept-Encoding': 'gzip, deflate, br',
       'Connection': 'keep-alive',
       'Upgrade-Insecure-Requests': '1',
     };
 
-    // Retry up to 3 times with increasing delays for rate limits (429)
-    const maxRetries = 3;
-    let lastError = null;
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      try {
-        if (attempt > 0) {
-          // Wait before retry: 2s, 5s
-          await new Promise(r => setTimeout(r, attempt * 2500));
-        }
-
-        const ao3Response = await fetch(targetUrl, {
-          headers: fetchHeaders,
-          redirect: 'follow',
-        });
-
-        if (ao3Response.status === 429) {
-          const retryAfter = ao3Response.headers.get('Retry-After');
-          const waitSec = retryAfter ? parseInt(retryAfter) : 5;
-          lastError = `Rate limited (429), Retry-After: ${waitSec}s`;
-          // Wait up to 45 seconds if AO3 tells us to (CF Workers have 30s CPU limit but wall clock is fine)
-          if (waitSec <= 45) {
-            await new Promise(r => setTimeout(r, (waitSec + 2) * 1000));
-          }
-          continue; // retry
-        }
-
-        if (!ao3Response.ok) {
-          return jsonResponse(
-            { error: `AO3 returned status ${ao3Response.status}` },
-            ao3Response.status,
-            request,
-            env
-          );
-        }
-
-        const html = await ao3Response.text();
-
-        return new Response(html, {
-          status: 200,
-          headers: {
-            'Content-Type': 'text/html; charset=utf-8',
-            ...corsHeaders(request, env),
-          },
-        });
-      } catch (err) {
-        lastError = err.message;
-        continue; // retry on network errors too
+    // For HTML pages, ensure ?view_adult=true is present
+    let finalUrl = targetUrl;
+    if (!isEpubDownload) {
+      const fetchUrl = new URL(targetUrl);
+      if (!fetchUrl.searchParams.has('view_adult')) {
+        fetchUrl.searchParams.set('view_adult', 'true');
       }
+      finalUrl = fetchUrl.toString();
     }
 
-    // All retries exhausted
-    return jsonResponse(
-      { error: `AO3 fetch failed after ${maxRetries} attempts: ${lastError}` },
-      502,
-      request,
-      env
-    );
+    try {
+      const ao3Response = await fetch(finalUrl, {
+        headers: fetchHeaders,
+        redirect: 'follow',
+      });
+
+      if (ao3Response.status === 429) {
+        const retryAfter = ao3Response.headers.get('Retry-After');
+        const retryAfterSec = retryAfter ? parseInt(retryAfter) : 60;
+        return jsonResponse(
+          {
+            error: `AO3 rate limited (429). Try again in ${retryAfterSec}s.`,
+            rateLimited: true,
+            retryAfter: retryAfterSec,
+          },
+          429,
+          request,
+          env
+        );
+      }
+
+      if (!ao3Response.ok) {
+        return jsonResponse(
+          { error: `AO3 returned status ${ao3Response.status}` },
+          ao3Response.status,
+          request,
+          env
+        );
+      }
+
+      // EPUB download — return as base64 JSON so the client can pass it to the server
+      if (isEpubDownload) {
+        const buffer = await ao3Response.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+
+        // Convert to base64 in chunks to avoid call stack overflow on large files
+        let binary = '';
+        const chunkSize = 8192;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+        }
+        const base64 = btoa(binary);
+
+        return jsonResponse({ epub: base64, size: bytes.length }, 200, request, env);
+      }
+
+      // HTML page — return as text
+      const html = await ao3Response.text();
+      return new Response(html, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          ...corsHeaders(request, env),
+        },
+      });
+    } catch (err) {
+      return jsonResponse(
+        { error: `AO3 fetch failed: ${err.message}`, rateLimited: false, retryAfter: 0 },
+        502,
+        request,
+        env
+      );
+    }
   },
 };
 
