@@ -73,7 +73,7 @@ app.use(cors({
   ],
   credentials: true,
 }));
-app.use(express.json());
+app.use(express.json({ limit: '30mb' }));
 
 // Async route wrapper — catches unhandled errors so Express doesn't crash
 const asyncHandler = (fn) => (req, res, next) =>
