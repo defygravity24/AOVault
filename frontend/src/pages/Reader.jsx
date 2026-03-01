@@ -1,9 +1,14 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import toast from 'react-hot-toast'
 import { ArrowLeftIcon, ExternalLinkIcon } from '../components/Icons'
 import { API_URL, apiFetch } from '../config'
 import { getCachedContent } from '../utils/offlineCache'
+
+// AO3's preface.xhtml has distinctive metadata classes — skip it as a story chapter
+const isPrefaceChapter = (html = '') =>
+  html.includes('work meta group') ||
+  html.includes('preface group')
 
 export default function Reader() {
   const { id } = useParams()
@@ -12,6 +17,7 @@ export default function Reader() {
   const [content, setContent] = useState(null)
   const [loading, setLoading] = useState(true)
   const [currentChapter, setCurrentChapter] = useState(0)
+  const [showInfo, setShowInfo] = useState(false)
   const [fontSize, setFontSize] = useState(() => {
     return parseInt(localStorage.getItem('aovault_reader_fontsize') || '18')
   })
@@ -48,6 +54,13 @@ export default function Reader() {
     setThemeKey(next.key)
     localStorage.setItem('aovault_reader_theme', next.key)
   }
+
+  // Filter out the AO3 preface chapter (fandom tags, metadata HTML)
+  // so only actual story chapters are shown
+  const storyChapters = useMemo(() => {
+    if (!content?.chapters) return []
+    return content.chapters.filter(ch => !isPrefaceChapter(ch.html))
+  }, [content])
 
   useEffect(() => {
     loadContent()
@@ -137,9 +150,18 @@ export default function Reader() {
     )
   }
 
-  // Render cached content
-  const chapter = content.chapters[currentChapter]
-  const totalChapters = content.chapters.length
+  // Render cached content — using storyChapters (preface filtered out)
+  const chapter = storyChapters[currentChapter]
+  const totalChapters = storyChapters.length
+
+  // Bail out if all chapters were filtered (shouldn't happen, but be safe)
+  if (totalChapters === 0) {
+    return (
+      <div className="min-h-screen bg-vault-bg flex items-center justify-center">
+        <p className="text-vault-muted">No readable chapters found.</p>
+      </div>
+    )
+  }
 
   const themeStyle = {
     backgroundColor: currentTheme.bg,
@@ -234,15 +256,84 @@ export default function Reader() {
 
       {/* Content */}
       <div className="max-w-2xl mx-auto px-5 py-6" style={{ fontFamily: currentFont.family }}>
-        {/* Author pre-note */}
-        {currentChapter === 0 && content.preNote && (
-          <div className="mb-6 p-4 rounded-lg border" style={{ backgroundColor: currentTheme.card, borderColor: currentTheme.border }}>
-            <p className="text-xs uppercase tracking-wide mb-2" style={{ color: currentTheme.muted }}>Author's Note</p>
-            <div
-              className="reader-content text-sm"
-              style={{ fontSize: fontSize - 2, color: currentTheme.text }}
-              dangerouslySetInnerHTML={{ __html: content.preNote }}
-            />
+
+        {/* Fic info panel — shown above chapter 1 */}
+        {currentChapter === 0 && fic && (
+          <div className="mb-8 rounded-xl border overflow-hidden" style={{ borderColor: currentTheme.border }}>
+            {/* Collapsed toggle bar */}
+            <button
+              onClick={() => setShowInfo(prev => !prev)}
+              className="w-full flex items-center justify-between px-4 py-3 text-left"
+              style={{ backgroundColor: currentTheme.card }}
+            >
+              <div>
+                <p className="font-semibold text-sm">{fic.title}</p>
+                <p className="text-xs mt-0.5" style={{ color: currentTheme.muted }}>
+                  by {fic.author}
+                  {fic.word_count ? ` · ${Math.round(fic.word_count / 1000)}k words` : ''}
+                  {fic.status ? ` · ${fic.status}` : ''}
+                </p>
+              </div>
+              <span className="text-xs ml-4 shrink-0" style={{ color: currentTheme.muted }}>
+                {showInfo ? 'Hide info ▲' : 'Show info ▼'}
+              </span>
+            </button>
+
+            {showInfo && (
+              <div className="px-4 pb-4 pt-1 space-y-3" style={{ backgroundColor: currentTheme.card }}>
+                {/* Fandom & ship */}
+                {(fic.fandom || fic.ship) && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {fic.fandom?.split(',').map((f, i) => (
+                      <span key={i} className="text-xs px-2 py-0.5 rounded-full border"
+                        style={{ borderColor: currentTheme.border, color: currentTheme.muted }}>
+                        {f.trim()}
+                      </span>
+                    ))}
+                    {fic.ship?.split(',').map((s, i) => (
+                      <span key={i} className="text-xs px-2 py-0.5 rounded-full border"
+                        style={{ borderColor: currentTheme.border, color: currentTheme.text }}>
+                        {s.trim()}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {/* Summary */}
+                {fic.summary && (
+                  <div>
+                    <p className="text-xs uppercase tracking-wide mb-1" style={{ color: currentTheme.muted }}>Summary</p>
+                    <p className="text-sm leading-relaxed" style={{ color: currentTheme.text }}>{fic.summary}</p>
+                  </div>
+                )}
+
+                {/* Tags */}
+                {fic.tags && (
+                  <div>
+                    <p className="text-xs uppercase tracking-wide mb-1" style={{ color: currentTheme.muted }}>Tags</p>
+                    <div className="flex flex-wrap gap-1">
+                      {fic.tags.split(',').map((tag, i) => (
+                        <span key={i} className="text-xs px-2 py-0.5 rounded border"
+                          style={{ borderColor: currentTheme.border, color: currentTheme.muted }}>
+                          {tag.trim()}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Author notes (preNote from content) */}
+                {content.preNote && (
+                  <div>
+                    <p className="text-xs uppercase tracking-wide mb-1" style={{ color: currentTheme.muted }}>Author's Note</p>
+                    <div className="text-sm leading-relaxed reader-content"
+                      style={{ color: currentTheme.text }}
+                      dangerouslySetInnerHTML={{ __html: content.preNote }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 

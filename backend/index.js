@@ -1690,7 +1690,7 @@ async function parseEpubToChapters(epubPath) {
 
   // Walk spine in order
   const spineItems = [...opfContent.matchAll(/<itemref\s+idref="([^"]+)"/gi)];
-  const skipPaths = /(nav|cover|title|toc|copyright|acknowledgement)/i;
+  const skipPaths = /(nav|cover|title|toc|copyright|acknowledgement|preface)/i;
   const chapters = [];
 
   for (const m of spineItems) {
