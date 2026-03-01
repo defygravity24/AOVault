@@ -343,21 +343,22 @@ async function initDatabase() {
 // AUTH MIDDLEWARE
 // =====================================
 
-// JWT auth — no token = guest (userId 1), bad token = guest (never 401)
+// JWT auth — no token = guest (userId 1), bad/expired token = 401
 const authMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    req.userId = 1; // Guest mode
+    req.userId = 1; // Guest mode — no token provided
     return next();
   }
   const token = authHeader.replace('Bearer ', '');
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.userId = decoded.userId;
+    return next();
   } catch {
-    req.userId = 1; // Expired/invalid = guest
+    // Token was provided but is invalid/expired — tell the client to re-authenticate
+    return res.status(401).json({ error: 'Session expired. Please log in again.' });
   }
-  next();
 };
 
 // Apply auth to all /api routes
