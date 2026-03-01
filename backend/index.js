@@ -759,12 +759,16 @@ async function downloadAO3Epub(workId, userId = 1) {
       console.log('EPUB download: direct succeeded');
     } catch (directErr) {
       console.log(`EPUB direct failed (${directErr.message}), trying CF Worker...`);
+      // CF Worker returns JSON { epub: base64string, size: number } — NOT arraybuffer
       const proxyResponse = await getAxios().get(
         `${workerUrl}/?url=${encodeURIComponent(epubUrl)}`,
-        { responseType: 'arraybuffer', timeout: 30000 }
+        { timeout: 60000 }
       );
-      data = proxyResponse.data;
-      console.log('EPUB download: CF Worker succeeded');
+      if (!proxyResponse.data?.epub) {
+        throw new Error('CF Worker returned no EPUB data');
+      }
+      data = Buffer.from(proxyResponse.data.epub, 'base64');
+      console.log(`EPUB download: CF Worker succeeded (${data.length} bytes)`);
     }
 
     // Create storage directory
