@@ -2189,6 +2189,208 @@ app.post('/api/monitor/check', async (req, res) => {
   res.json(results);
 });
 
+// ── Legal & Support pages (required for App Store) ──
+const legalPageStyle = `
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #e6edf3; line-height: 1.7; padding: 2rem; max-width: 720px; margin: 0 auto; }
+  h1 { color: #58a6ff; margin-bottom: 0.5rem; font-size: 1.8rem; }
+  h2 { color: #58a6ff; margin-top: 2rem; margin-bottom: 0.5rem; font-size: 1.3rem; border-bottom: 1px solid #21262d; padding-bottom: 0.3rem; }
+  h3 { color: #c9d1d9; margin-top: 1.2rem; margin-bottom: 0.3rem; }
+  p, li { color: #c9d1d9; margin-bottom: 0.6rem; }
+  ul { padding-left: 1.5rem; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .updated { color: #8b949e; font-size: 0.9rem; margin-bottom: 1.5rem; }
+  .footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #21262d; color: #8b949e; font-size: 0.85rem; text-align: center; }
+`;
+
+app.get('/privacy', (req, res) => {
+  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Privacy Policy - AO Vault</title><style>${legalPageStyle}</style></head><body>
+<h1>Privacy Policy</h1>
+<p class="updated">Last Updated: March 1, 2026</p>
+
+<h2>Introduction</h2>
+<p>AO Vault ("we," "our," or "us") is committed to protecting your privacy. This Privacy Policy explains how we collect, use, and safeguard your information when you use our application.</p>
+
+<h2>Information We Collect</h2>
+<h3>Account Information</h3>
+<ul>
+<li><strong>Username and email</strong>: Used for authentication and account recovery</li>
+<li><strong>Password</strong>: Stored securely using industry-standard hashing</li>
+</ul>
+<h3>Library Data</h3>
+<ul>
+<li><strong>Fanfiction metadata</strong>: URLs, titles, authors, tags, and summaries of stories you save</li>
+<li><strong>Personal notes</strong>: Any custom tags or notes you add to saved stories</li>
+<li><strong>Reading data</strong>: Downloaded content for offline reading</li>
+<li><strong>Preferences</strong>: Reading preferences and app settings</li>
+</ul>
+<h3>Automatically Collected</h3>
+<ul>
+<li><strong>Device information</strong>: Device type and OS version (for compatibility)</li>
+<li><strong>Crash reports</strong>: Technical information if the app crashes (no personal data included)</li>
+</ul>
+
+<h2>How We Use Your Information</h2>
+<ul>
+<li>Save and organize your fanfiction library</li>
+<li>Provide app functionality (search, filtering, offline reading)</li>
+<li>Improve app performance and fix bugs</li>
+<li>Authenticate your account</li>
+</ul>
+
+<h2>Data Storage and Security</h2>
+<ul>
+<li>Your library data is stored on our secure servers</li>
+<li>All network requests use HTTPS encryption</li>
+<li>Passwords are hashed and never stored in plain text</li>
+<li>Downloaded content (EPUBs) is cached locally on your device for offline access</li>
+</ul>
+
+<h2>Data Sharing</h2>
+<p><strong>We do not sell, trade, or rent your personal information to third parties.</strong></p>
+<p>We may share information only if required by law or valid legal process, or with your explicit consent.</p>
+
+<h2>Third-Party Services</h2>
+<h3>Archive of Our Own (AO3)</h3>
+<ul>
+<li>When you save a fic, we retrieve publicly available information from AO3</li>
+<li>We do not store your AO3 credentials</li>
+<li>We are not affiliated with the Organization for Transformative Works</li>
+</ul>
+
+<h2>Age Requirement</h2>
+<p>AO Vault is rated 17+ due to fanfiction content that may contain mature themes. You must be at least 17 years old to use this app. We do not knowingly collect information from anyone under 17.</p>
+
+<h2>Your Rights</h2>
+<ul>
+<li><strong>Access</strong>: View all data the app has saved</li>
+<li><strong>Delete</strong>: Remove any or all saved fanfiction, or delete your account entirely</li>
+<li><strong>Export</strong>: Export your library data</li>
+</ul>
+
+<h2>Data Retention</h2>
+<ul>
+<li>Your data is retained as long as your account is active</li>
+<li>Deleting your account removes all associated data</li>
+<li>Locally cached content is removed when the app is deleted</li>
+</ul>
+
+<h2>Changes to This Policy</h2>
+<p>We may update this Privacy Policy from time to time. We will notify you of changes by updating the date at the top of this page.</p>
+
+<h2>Contact Us</h2>
+<p>If you have questions about this Privacy Policy, contact us at:<br><strong>Email</strong>: <a href="mailto:support@aovault.net">support@aovault.net</a><br><strong>Website</strong>: <a href="https://aovault.net">aovault.net</a></p>
+
+<div class="footer">AO Vault &mdash; Built by fans, for fans.</div>
+</body></html>`);
+});
+
+app.get('/terms', (req, res) => {
+  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Terms of Service - AO Vault</title><style>${legalPageStyle}</style></head><body>
+<h1>Terms of Service</h1>
+<p class="updated">Effective Date: March 1, 2026</p>
+
+<h2>1. Acceptance of Terms</h2>
+<p>By downloading, installing, or using AO Vault ("the App"), you agree to be bound by these Terms of Service. If you do not agree, please do not use the App.</p>
+
+<h2>2. Description of Service</h2>
+<p>AO Vault is a personal library application that allows users to save, organize, and read fanfiction from Archive of Our Own (AO3) for offline access.</p>
+
+<h2>3. Age Requirement</h2>
+<p>You must be at least 17 years old to use this App. Fanfiction content accessed through the App may contain mature themes.</p>
+
+<h2>4. User Accounts</h2>
+<ul>
+<li>You are responsible for maintaining the security of your account</li>
+<li>You are responsible for all content you save and notes you create</li>
+<li>You agree to use the App in compliance with all applicable laws</li>
+</ul>
+
+<h2>5. Content and Intellectual Property</h2>
+<ul>
+<li>Fanfiction content belongs to the original authors on AO3</li>
+<li>AO Vault does not claim ownership of any fanfiction content</li>
+<li>You retain all rights to personal notes and tags you create</li>
+<li>The AO Vault app, its design, and functionality are our intellectual property</li>
+</ul>
+
+<h2>6. Acceptable Use</h2>
+<p>You agree NOT to:</p>
+<ul>
+<li>Use the App for any illegal purpose</li>
+<li>Redistribute saved content without permission from original authors</li>
+<li>Use automated systems to mass-download content through the App</li>
+<li>Violate AO3's Terms of Service</li>
+<li>Attempt to gain unauthorized access to the App or its systems</li>
+</ul>
+
+<h2>7. Disclaimers</h2>
+<ul>
+<li>The App is provided "as is" without warranties of any kind</li>
+<li>We do not guarantee uninterrupted or error-free operation</li>
+<li>We are not responsible for the content of fanfiction saved through the App</li>
+<li>We may modify or discontinue the App at any time</li>
+</ul>
+
+<h2>8. Limitation of Liability</h2>
+<p>To the maximum extent permitted by law, we shall not be liable for any indirect, incidental, special, consequential, or punitive damages arising from your use of the App.</p>
+
+<h2>9. Changes to Terms</h2>
+<p>We may update these Terms at any time. Continued use of the App after changes constitutes acceptance of the updated Terms.</p>
+
+<h2>10. Governing Law</h2>
+<p>These Terms are governed by the laws of the State of California, United States.</p>
+
+<h2>11. Contact</h2>
+<p><strong>Email</strong>: <a href="mailto:support@aovault.net">support@aovault.net</a><br><strong>Website</strong>: <a href="https://aovault.net">aovault.net</a></p>
+
+<div class="footer">AO Vault &mdash; Built by fans, for fans.</div>
+</body></html>`);
+});
+
+app.get('/support', (req, res) => {
+  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Support - AO Vault</title><style>${legalPageStyle}</style></head><body>
+<h1>AO Vault Support</h1>
+<p class="updated">We're here to help!</p>
+
+<h2>Contact Us</h2>
+<p>For any questions, bug reports, or feature requests, please reach out:</p>
+<ul>
+<li><strong>Email</strong>: <a href="mailto:support@aovault.net">support@aovault.net</a></li>
+<li><strong>Website</strong>: <a href="https://aovault.net">aovault.net</a></li>
+</ul>
+
+<h2>Frequently Asked Questions</h2>
+
+<h3>How do I save a fic?</h3>
+<p>You can paste an AO3 URL directly in the app, or use the Share Extension from Safari: open an AO3 story, tap Share, and select "Save to AO Vault."</p>
+
+<h3>How does offline reading work?</h3>
+<p>After saving a fic, tap "Read Offline" to download the full text. Once downloaded, you can read it anytime without an internet connection.</p>
+
+<h3>What if AO3 is down?</h3>
+<p>If AO3 is temporarily unavailable, you can still read any fics you've already downloaded for offline access. New imports will need to wait until AO3 is back up.</p>
+
+<h3>I'm getting a rate limit error</h3>
+<p>AO3 limits how many requests can be made in a short time. If you see this error, wait about 60 seconds and try again. Under normal use (saving a fic every few minutes), you won't hit this limit.</p>
+
+<h3>How do I delete my account?</h3>
+<p>Contact us at <a href="mailto:support@aovault.net">support@aovault.net</a> and we will delete your account and all associated data.</p>
+
+<h3>Is my data private?</h3>
+<p>Yes. We don't sell, share, or trade your data. Your library is yours. See our <a href="/privacy">Privacy Policy</a> for details.</p>
+
+<h2>App Information</h2>
+<ul>
+<li><a href="/privacy">Privacy Policy</a></li>
+<li><a href="/terms">Terms of Service</a></li>
+</ul>
+
+<div class="footer">AO Vault &mdash; Built by fans, for fans.</div>
+</body></html>`);
+});
+
 // In production, serve frontend for any non-API route (SPA fallback)
 if (isProduction) {
   const frontendPath = path.join(__dirname, 'public');
