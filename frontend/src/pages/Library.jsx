@@ -9,7 +9,7 @@ import Sidebar from '../components/Sidebar'
 import ShipPill from '../components/ShipPill'
 import { BookIcon, HeartIcon, VaultIcon, FilterIcon, SortIcon, MenuIcon, LinkIcon } from '../components/Icons'
 import { API_URL, apiFetch } from '../config'
-import { cacheFicMeta, getCachedFicMeta } from '../utils/offlineCache'
+import { cacheFicMeta, getCachedFicMeta, cacheFicContent } from '../utils/offlineCache'
 
 // Format word count nicely
 const formatWordCount = (count) => {
@@ -26,7 +26,6 @@ const formatWordCount = (count) => {
 export default function Library() {
   const navigate = useNavigate()
   const [fics, setFics] = useState([])
-  const [stats, setStats] = useState({ totalFics: 0, favorites: 0, totalWords: 0 })
   const [loading, setLoading] = useState(true)
   const [showImport, setShowImport] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -45,17 +44,19 @@ export default function Library() {
   const [collections, setCollections] = useState([])
   const [activeCollectionId, setActiveCollectionId] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  // IDs of fics in the currently-active custom collection (null = not filtering by custom collection)
+  const [collectionFicIds, setCollectionFicIds] = useState(null)
 
   // Quick import from URL (used by paste bar and deep links)
-  const quickImport = useCallback(async (url) => {
+  const quickImport = useCallback(async (url, retryAttempt = 0) => {
     if (!url || !url.includes('archiveofourown.org/works/')) {
       toast.error('Paste a valid AO3 URL')
       return
     }
     setImporting(true)
-    const loadingToast = toast.loading('Saving from AO3...')
+    const loadingToast = toast.loading(retryAttempt > 0 ? 'Retrying AO3 import...' : 'Saving from AO3...')
     try {
-      // First try: let server fetch from AO3
+      // Step 1: Ask server to fetch + parse
       let response = await apiFetch(`${API_URL}/fics/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -63,14 +64,32 @@ export default function Library() {
       })
       let data = await response.json()
 
-      // If server can't reach AO3 (Cloudflare block), use CF Worker proxy from browser
+      // Step 2: Server can't reach AO3 — browser relay via CF Worker
       if (response.status === 422 && data.needsClientFetch) {
         toast.dismiss(loadingToast)
         const relayToast = toast.loading('Fetching from AO3 via proxy...')
         try {
           const workerUrl = 'https://ao3-proxy.defy-gravity-24-sda.workers.dev'
-          const ao3Response = await fetch(`${workerUrl}/?url=${encodeURIComponent(url)}`)
-          if (!ao3Response.ok) throw new Error(`Proxy returned ${ao3Response.status}`)
+          // Ensure view_adult=true
+          const ao3Url = new URL(url)
+          if (!ao3Url.searchParams.has('view_adult')) ao3Url.searchParams.set('view_adult', 'true')
+          const ao3Response = await fetch(`${workerUrl}/?url=${encodeURIComponent(ao3Url.toString())}`)
+
+          if (!ao3Response.ok) {
+            // Check for rate limit — auto-retry once after waiting
+            if ((ao3Response.status === 429 || ao3Response.status === 502) && retryAttempt < 2) {
+              const body = await ao3Response.json().catch(() => ({}))
+              const waitSec = Math.min(body.retryAfter || 30, 90)
+              toast.dismiss(relayToast)
+              const waitToast = toast.loading(`AO3 rate limited — retrying in ${waitSec}s...`)
+              await new Promise(r => setTimeout(r, waitSec * 1000))
+              toast.dismiss(waitToast)
+              setImporting(false)
+              return quickImport(url, retryAttempt + 1)
+            }
+            throw new Error(`Proxy returned ${ao3Response.status}`)
+          }
+
           const html = await ao3Response.text()
           response = await apiFetch(`${API_URL}/fics/import`, {
             method: 'POST',
@@ -81,7 +100,7 @@ export default function Library() {
           toast.dismiss(relayToast)
         } catch (relayErr) {
           toast.dismiss(relayToast)
-          throw new Error('Could not reach AO3. Please try again in a minute.')
+          throw new Error(relayErr.message || 'Could not reach AO3. Please try again in a minute.')
         }
       }
 
@@ -94,10 +113,14 @@ export default function Library() {
       if (!response.ok) throw new Error(data.error || 'Import failed')
       toast.dismiss(loadingToast)
       toast.success(`"${data.fic.title}" saved to vault!`)
+      if (data.epubFailed) {
+        toast('EPUB download failed — you can retry from the fic page', { icon: '⚠️', duration: 5000 })
+      }
       setFics(prev => [data.fic, ...prev])
-      fetchStats()
       fetchCollections()
       setPasteUrl('')
+      // Auto-cache for offline reading right after import
+      autoSaveOffline(data.fic.id)
     } catch (err) {
       toast.dismiss(loadingToast)
       toast.error(err.message || 'Failed to import')
@@ -106,53 +129,29 @@ export default function Library() {
     }
   }, [])
 
-  // Handle deep links from iOS (aovault://import?url=...)
+  // Handle share imports — listen for real-time events from ShareImportBridge
+  // AND process any pending URLs that arrived before Library mounted
   useEffect(() => {
-    let cleanup
-    const setupDeepLinks = async () => {
-      try {
-        const { App } = await import('@capacitor/app')
-        const listener = await App.addListener('appUrlOpen', (event) => {
-          const url = event.url
-          if (url) {
-            if (url.startsWith('aovault://import')) {
-              const params = new URL(url)
-              const ao3Url = params.searchParams.get('url')
-              if (ao3Url) quickImport(ao3Url)
-            } else if (url.includes('archiveofourown.org')) {
-              const ao3Url = url.replace('aovault://', 'https://')
-              quickImport(ao3Url)
-            }
-          }
-        })
-        cleanup = () => listener.remove()
-      } catch {
-        // Not running in Capacitor — skip
-      }
+    const handleShareImport = (e) => {
+      const url = e.detail?.url
+      if (url) quickImport(url)
     }
-    setupDeepLinks()
-    return () => cleanup?.()
-  }, [quickImport])
+    window.addEventListener('aovault:share-import', handleShareImport)
 
-  // Handle URLs from iOS Share Extension (via AppDelegate bridge)
-  useEffect(() => {
-    // Register the global callback for native → JS communication
-    window.__aovaultShareImport = (url) => {
-      quickImport(url)
-    }
-    // Process any URLs that arrived before this component mounted
+    // Process any URLs that queued before this component mounted
     if (window.__aovaultPendingImports?.length) {
-      window.__aovaultPendingImports.forEach(url => quickImport(url))
+      const urls = [...window.__aovaultPendingImports]
       window.__aovaultPendingImports = []
+      urls.forEach(url => quickImport(url))
     }
-    return () => { delete window.__aovaultShareImport }
+
+    return () => window.removeEventListener('aovault:share-import', handleShareImport)
   }, [quickImport])
 
   // Fetch fics and collections on mount
   useEffect(() => {
     fetchCollections()
     fetchFics()
-    fetchStats()
   }, [])
 
   const fetchFics = async () => {
@@ -193,21 +192,52 @@ export default function Library() {
     }
   }
 
-  const fetchStats = async () => {
+  // Fetch fic IDs for a custom collection so we can filter the grid
+  const fetchCollectionFics = async (collectionId, currentCollections) => {
+    const cols = currentCollections || collections
+    if (!collectionId) { setCollectionFicIds(null); return }
+    const col = cols.find(c => c.id === collectionId)
+    if (!col || col.is_smart) { setCollectionFicIds(null); return }
     try {
-      const response = await apiFetch(`${API_URL}/stats`)
+      const response = await apiFetch(`${API_URL}/collections/${collectionId}/fics`)
       const data = await response.json()
-      setStats(data)
+      setCollectionFicIds(new Set((data.fics || []).map(f => f.id)))
     } catch (err) {
-      console.error('Failed to fetch stats:', err)
+      console.error('Failed to fetch collection fics:', err)
+      setCollectionFicIds(new Set())
     }
   }
 
-  const handleImportSuccess = (newFic) => {
+  // Derive stats directly from fics state — always in sync, no extra API call needed
+  const stats = useMemo(() => ({
+    totalFics: fics.length,
+    favorites: fics.filter(f => f.favorite).length,
+    totalWords: fics.reduce((sum, f) => sum + (f.word_count || 0), 0),
+  }), [fics])
+
+  // Silently auto-cache a fic for offline reading right after import (fire-and-forget)
+  const autoSaveOffline = async (ficId) => {
+    try {
+      const res = await apiFetch(`${API_URL}/fics/${ficId}/content`)
+      if (!res.ok) return
+      const contentData = await res.json()
+      await cacheFicContent(ficId, contentData)
+      // Notify the FicCard to flip its button to "Read Offline"
+      window.dispatchEvent(new CustomEvent('aovault:fic-cached', { detail: { ficId } }))
+    } catch {
+      // Non-critical — user can still manually save offline later
+    }
+  }
+
+  const handleImportSuccess = (newFic, { epubFailed } = {}) => {
     setFics(prev => [newFic, ...prev])
-    fetchStats()
     fetchCollections()
     toast.success(`"${newFic.title}" saved to vault!`)
+    if (epubFailed) {
+      toast('EPUB download failed — you can retry from the fic page', { icon: '⚠️', duration: 5000 })
+    }
+    // Auto-cache for offline reading
+    autoSaveOffline(newFic.id)
   }
 
   const handleDelete = async (id) => {
@@ -217,7 +247,6 @@ export default function Library() {
     try {
       await apiFetch(`${API_URL}/fics/${id}`, { method: 'DELETE' })
       setFics(prev => prev.filter(f => f.id !== id))
-      fetchStats()
       fetchCollections()
       toast.success(`"${fic?.title}" removed`)
     } catch (err) {
@@ -234,7 +263,6 @@ export default function Library() {
         body: JSON.stringify({ favorite }),
       })
       setFics(prev => prev.map(f => f.id === id ? { ...f, favorite: favorite ? 1 : 0 } : f))
-      fetchStats()
       fetchCollections()
       toast(favorite ? '❤️ Added to favorites' : 'Removed from favorites', { duration: 2000 })
     } catch (err) {
@@ -253,6 +281,7 @@ export default function Library() {
     setFilterStatus('')
     setFilterRating('')
     setSearchQuery('')
+    fetchCollectionFics(collectionId)
   }
 
   const handleCreateCollection = async ({ name, icon }) => {
@@ -295,7 +324,7 @@ export default function Library() {
   const filteredFics = useMemo(() => {
     let result = [...fics]
 
-    // Apply smart collection filter
+    // Apply collection filter
     if (activeCollection?.is_smart) {
       const rules = JSON.parse(activeCollection.smart_rules || '{}')
       switch (rules.type) {
@@ -312,6 +341,9 @@ export default function Library() {
           result = result.filter(f => f.status === 'Complete')
           break
       }
+    } else if (activeCollection && !activeCollection.is_smart && collectionFicIds !== null) {
+      // Custom collection — only show fics that are members
+      result = result.filter(f => collectionFicIds.has(f.id))
     }
 
     // Apply search
@@ -347,7 +379,7 @@ export default function Library() {
     })
 
     return result
-  }, [fics, activeCollection, searchQuery, filterStatus, filterRating, filterShip, sortBy])
+  }, [fics, activeCollection, collectionFicIds, searchQuery, filterStatus, filterRating, filterShip, sortBy])
 
   const hasActiveFilters = filterStatus || filterRating || filterShip
 
@@ -550,6 +582,10 @@ export default function Library() {
                   onToggleFavorite={handleToggleFavorite}
                   onShipClick={handleShipClick}
                   collections={collections.filter(c => !c.is_smart)}
+                  onAddedToCollection={() => {
+                    fetchCollectionFics(activeCollectionId)
+                    fetchCollections()
+                  }}
                 />
               ))}
             </div>
