@@ -36,18 +36,25 @@ if (isProduction) {
   }
 }
 
-// JWT Secret — generate once, persist in .env
-const envPath = path.join(__dirname, '.env');
-let JWT_SECRET;
-if (fs.existsSync(envPath)) {
-  const envContent = fs.readFileSync(envPath, 'utf8');
-  const match = envContent.match(/JWT_SECRET=(.+)/);
-  if (match) JWT_SECRET = match[1].trim();
+// JWT Secret — load from environment first (required in production on Render/Heroku/etc.)
+// Fallback: read from local .env file (development only)
+// NEVER generate a random one at runtime — that logs everyone out on each restart
+let JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  const envPath = path.join(__dirname, '.env');
+  if (fs.existsSync(envPath)) {
+    const envContent = fs.readFileSync(envPath, 'utf8');
+    const match = envContent.match(/JWT_SECRET=(.+)/);
+    if (match) JWT_SECRET = match[1].trim();
+  }
 }
 if (!JWT_SECRET) {
+  // Local dev only: generate once and save to .env so it persists across restarts
   JWT_SECRET = crypto.randomBytes(64).toString('hex');
+  const envPath = path.join(__dirname, '.env');
   fs.appendFileSync(envPath, `\nJWT_SECRET=${JWT_SECRET}\n`);
-  console.log('Generated JWT_SECRET and saved to .env');
+  console.log('[auth] Generated JWT_SECRET and saved to .env (dev only)');
+  console.warn('[auth] WARNING: Set JWT_SECRET as an env var in production to avoid logouts on restart');
 }
 
 // Middleware
@@ -806,18 +813,40 @@ app.post('/api/fics/import', async (req, res) => {
         // Client already fetched the HTML — just parse it
         ficData = parseAO3Html(url, html);
       } else {
-        // Try server-side fetch, fall back to asking client to relay
+        // Try server-side fetch, fall back to EPUB download, then ask client to relay
         try {
           ficData = await parseAO3Work(url);
         } catch (fetchErr) {
-          // Any fetch failure → ask the client to relay the HTML instead
-          // This covers: 403, 429, 502, 503, 525, rate limits, CF blocks, timeouts, etc.
-          console.log(`Server-side AO3 fetch failed: ${fetchErr.message} — requesting client relay`);
-          return res.status(422).json({
-            error: 'ao3_blocked',
-            message: 'Server cannot reach AO3. Please retry — the app will fetch it directly.',
-            needsClientFetch: true,
-          });
+          console.log(`Server-side AO3 fetch failed: ${fetchErr.message} — trying EPUB fallback`);
+          // EPUB fallback: download the epub and parse preface.xhtml for metadata.
+          // AO3's download endpoint is often reachable even when the HTML page is blocked.
+          try {
+            const ao3Regex = /archiveofourown\.org\/works\/(\d+)/;
+            const workId = url.match(ao3Regex)?.[1];
+            if (workId) {
+              const epubPath = await downloadAO3Epub(workId, userId);
+              if (epubPath) {
+                const epubFiles = await readEpubFiles(epubPath);
+                const prefaceKey = Object.keys(epubFiles).find(k => /preface/i.test(k));
+                if (prefaceKey) {
+                  ficData = parseAO3Html(url, epubFiles[prefaceKey]);
+                  ficData.epub_path = epubPath; // reuse — skip re-download below
+                  console.log(`[import] EPUB fallback succeeded for work ${workId}`);
+                }
+              }
+            }
+          } catch (epubErr) {
+            console.log(`[import] EPUB fallback also failed: ${epubErr.message}`);
+          }
+          // If both server HTML and EPUB fallback failed, ask the client to relay
+          if (!ficData) {
+            console.log(`[import] All server-side strategies failed — requesting client relay`);
+            return res.status(422).json({
+              error: 'ao3_blocked',
+              message: 'Server cannot reach AO3. Please retry — the app will fetch it directly.',
+              needsClientFetch: true,
+            });
+          }
         }
       }
     } else if (url.includes('fanfiction.net')) {
@@ -840,9 +869,11 @@ app.post('/api/fics/import', async (req, res) => {
       });
     }
 
-    // Download epub
-    const epubPath = await downloadAO3Epub(ficData.source_id, userId);
-    ficData.epub_path = epubPath;
+    // Download epub (skip if EPUB fallback already downloaded it during metadata parse)
+    if (!ficData.epub_path) {
+      const epubPath = await downloadAO3Epub(ficData.source_id, userId);
+      ficData.epub_path = epubPath;
+    }
 
     // Save to database
     const result = await db.prepare(`

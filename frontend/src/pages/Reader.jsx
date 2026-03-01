@@ -3,7 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom'
 import toast from 'react-hot-toast'
 import { ArrowLeftIcon, ExternalLinkIcon } from '../components/Icons'
 import { API_URL, apiFetch } from '../config'
-import { getCachedContent } from '../utils/offlineCache'
+import { getCachedContent, cacheFicContent } from '../utils/offlineCache'
 
 // AO3's preface.xhtml has distinctive metadata classes — skip it as a story chapter
 const isPrefaceChapter = (html = '') =>
@@ -68,19 +68,37 @@ export default function Reader() {
 
   const loadContent = async () => {
     try {
-      // Try to load cached content first (works offline)
+      // 1. Check IndexedDB first — instant, works fully offline
       const cached = await getCachedContent(parseInt(id))
       if (cached) {
         setContent(cached)
       }
 
-      // Also fetch fic metadata (for fallback display)
+      // 2. If not cached locally, fetch from server and auto-save to IndexedDB.
+      //    This means any fic you open once becomes available offline everywhere — no
+      //    manual "Save Offline" needed on each device.
+      if (!cached) {
+        try {
+          const response = await apiFetch(`${API_URL}/fics/${id}/content`)
+          const data = await response.json()
+          if (data.chapters?.length) {
+            await cacheFicContent(parseInt(id), data)
+            setContent(data)
+            // Notify any mounted FicCard to flip its button to "Read Offline"
+            window.dispatchEvent(new CustomEvent('aovault:fic-cached', { detail: { ficId: parseInt(id) } }))
+          }
+        } catch {
+          // Server unavailable — content stays null → "Not Downloaded Yet" fallback shown
+        }
+      }
+
+      // 3. Also fetch fic metadata for the info panel (non-critical)
       try {
         const response = await apiFetch(`${API_URL}/fics/${id}`)
         const data = await response.json()
         if (data.fic) setFic(data.fic)
       } catch {
-        // Offline — that's fine if we have cached content
+        // Offline — fine if we already have content
       }
     } catch (err) {
       console.error('Reader load error:', err)
